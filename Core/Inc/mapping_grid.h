@@ -36,6 +36,14 @@ typedef struct
   uint32_t revision;
 } MappingGridStats_t;
 
+typedef struct
+{
+  uint8_t cells[MAPPING_GRID_HEIGHT_CELLS][MAPPING_GRID_WIDTH_CELLS];
+  MappingGridPose_t pose;
+  bool pose_valid;
+  uint32_t revision;
+} MappingGridSnapshot_t;
+
 void MappingGrid_Init(void);
 void MappingGrid_Reset(void);
 void MappingGrid_SetPose(const MappingGridPose_t *pose);
@@ -46,7 +54,10 @@ bool MappingGrid_InsertPolarPointAtPose(const MappingGridPose_t *pose,
                                         uint16_t distance_mm,
                                         uint8_t quality);
 bool MappingGrid_WorldToCell(int32_t x_mm, int32_t y_mm, uint8_t *out_x, uint8_t *out_y);
+bool MappingGrid_CellToWorld(uint8_t x, uint8_t y, int32_t *out_x_mm, int32_t *out_y_mm);
 MappingGridCellState_t MappingGrid_GetCell(uint8_t x, uint8_t y);
+bool MappingGrid_CopySnapshot(MappingGridSnapshot_t *out_snapshot);
+void MappingGrid_MarkRobotFree(const MappingGridPose_t *pose, uint8_t radius_cells);
 bool MappingGrid_FormatRow(uint8_t row, char *out_text, uint16_t out_size);
 bool MappingGrid_GetStats(MappingGridStats_t *out_stats);
 uint32_t MappingGrid_GetRevision(void);

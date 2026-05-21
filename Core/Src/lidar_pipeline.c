@@ -205,6 +205,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   {
     BluetoothControl_OnUartRxCpltFromIsr(huart);
   }
+  else if (huart->Instance == USART2)
+  {
+    BluetoothControl_OnUartRxCpltFromIsr(huart);
+  }
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -215,6 +219,10 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     s_restart_pending = 1U;
   }
   else if (huart->Instance == USART6)
+  {
+    BluetoothControl_OnUartErrorFromIsr(huart);
+  }
+  else if (huart->Instance == USART2)
   {
     BluetoothControl_OnUartErrorFromIsr(huart);
   }

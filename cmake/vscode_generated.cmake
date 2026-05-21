@@ -13,6 +13,7 @@ target_link_options(${BUILD_UNIT_0_NAME} PRIVATE ${CUBE_CMAKE_EXE_LINKER_FLAGS})
 
 # Add sources to executable/library
 target_sources(${BUILD_UNIT_0_NAME} PRIVATE
+    "Core/Src/astar_planner.c"
     "Core/Src/bluetooth_control.c"
     "Core/Src/freertos.c"
     "Core/Src/lidar_pipeline.c"
@@ -20,6 +21,7 @@ target_sources(${BUILD_UNIT_0_NAME} PRIVATE
     "Core/Src/mapping_grid.c"
     "Core/Src/motor_control.c"
     "Core/Src/mpu6500.c"
+    "Core/Src/slam_nav.c"
     "Core/Src/stm32f4xx_hal_msp.c"
     "Core/Src/stm32f4xx_hal_timebase_tim.c"
     "Core/Src/stm32f4xx_it.c"
@@ -73,4 +75,3 @@ target_include_directories(${BUILD_UNIT_0_NAME} PRIVATE
 configure_file("${CMAKE_SOURCE_DIR}/STM32F446RETX_FLASH.ld" "${CMAKE_BINARY_DIR}" COPYONLY)
 
 set_target_properties(${BUILD_UNIT_0_NAME} PROPERTIES LINK_DEPENDS "STM32F446RETX_FLASH.ld")
-

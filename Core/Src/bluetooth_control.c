@@ -7,6 +7,7 @@
 #include "queue.h"
 #include "task.h"
 
+extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart6;
 
 #define BLUETOOTH_RX_LINE_QUEUE_LENGTH 4U
@@ -20,6 +21,14 @@ typedef struct
   char text[BLUETOOTH_LINE_MAX];
 } BluetoothLine_t;
 
+typedef struct
+{
+  UART_HandleTypeDef *huart;
+  uint8_t rx_byte;
+  char rx_line[BLUETOOTH_LINE_MAX];
+  uint8_t rx_line_len;
+} BluetoothRxContext_t;
+
 static StaticQueue_t s_rx_line_queue_struct;
 static uint8_t s_rx_line_queue_storage[BLUETOOTH_RX_LINE_QUEUE_LENGTH * sizeof(BluetoothLine_t)];
 static QueueHandle_t s_rx_line_queue;
@@ -29,13 +38,14 @@ static uint8_t s_command_queue_storage[BLUETOOTH_COMMAND_QUEUE_LENGTH * sizeof(B
 static QueueHandle_t s_command_queue;
 
 static BluetoothControlState_t s_state;
-static uint8_t s_rx_byte;
-static char s_rx_line[BLUETOOTH_LINE_MAX];
-static uint8_t s_rx_line_len;
+static BluetoothRxContext_t s_rx_uart6;
+static BluetoothRxContext_t s_rx_uart2;
 static bool s_initialized;
 static uint32_t s_last_rx_retry_tick_ms;
 
 static bool BluetoothControl_StartReceive(void);
+static bool BluetoothControl_StartReceiveContext(BluetoothRxContext_t *context);
+static BluetoothRxContext_t *BluetoothControl_GetRxContext(UART_HandleTypeDef *huart);
 static bool BluetoothControl_SendBytes(const uint8_t *data, uint16_t length);
 static void BluetoothControl_ProcessLine(const BluetoothLine_t *line);
 static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line);
@@ -73,6 +83,8 @@ bool BluetoothControl_Init(void)
   configASSERT(s_command_queue != NULL);
 
   s_initialized = true;
+  s_rx_uart6.huart = &huart6;
+  s_rx_uart2.huart = &huart2;
   s_state.ready = BluetoothControl_StartReceive();
   return s_state.ready;
 }
@@ -142,20 +154,32 @@ bool BluetoothControl_SendText(const char *text)
 
 static bool BluetoothControl_SendBytes(const uint8_t *data, uint16_t length)
 {
+  bool sent = false;
+
   if ((data == NULL) || (length == 0U))
   {
     return true;
   }
 
-  if (HAL_UART_Transmit(&huart6, (uint8_t *)data, length, 20U) != HAL_OK)
+  if (HAL_UART_Transmit(&huart6, (uint8_t *)data, length, 20U) == HAL_OK)
   {
-    s_state.ready = false;
-    return false;
+    sent = true;
   }
 
-  s_state.tx_count++;
-  s_state.last_tx_tick_ms = HAL_GetTick();
-  return true;
+  if (HAL_UART_Transmit(&huart2, (uint8_t *)data, length, 20U) == HAL_OK)
+  {
+    sent = true;
+  }
+
+  if (sent)
+  {
+    s_state.tx_count++;
+    s_state.last_tx_tick_ms = HAL_GetTick();
+    return true;
+  }
+
+  s_state.ready = false;
+  return false;
 }
 
 const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
@@ -173,6 +197,8 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_ODOM_DEBUG_OFF:  return "ODOM_DEBUG_OFF";
     case BLUETOOTH_CMD_AUTO_MAPPING_ON: return "AUTO_MAPPING_ON";
     case BLUETOOTH_CMD_AUTO_MAPPING_OFF:return "AUTO_MAPPING_OFF";
+    case BLUETOOTH_CMD_SLAM_NAV_ON:     return "SLAM_NAV_ON";
+    case BLUETOOTH_CMD_SLAM_NAV_OFF:    return "SLAM_NAV_OFF";
     case BLUETOOTH_CMD_TURN_LEFT_DEG:   return "TURN_LEFT_DEG";
     case BLUETOOTH_CMD_TURN_RIGHT_DEG:  return "TURN_RIGHT_DEG";
     case BLUETOOTH_CMD_DRIVE_FORWARD:   return "DRIVE_FORWARD";
@@ -189,68 +215,106 @@ void BluetoothControl_OnUartRxCpltFromIsr(UART_HandleTypeDef *huart)
 {
   BaseType_t higher_priority_task_woken = pdFALSE;
   BluetoothLine_t completed_line;
+  BluetoothRxContext_t *context;
   uint8_t byte;
 
-  if ((huart == NULL) || (huart->Instance != USART6) || (s_rx_line_queue == NULL))
+  context = BluetoothControl_GetRxContext(huart);
+  if ((context == NULL) || (s_rx_line_queue == NULL))
   {
     return;
   }
 
-  byte = s_rx_byte;
+  byte = context->rx_byte;
   s_state.rx_bytes++;
   s_state.last_rx_tick_ms = HAL_GetTick();
 
   if (BluetoothControl_IsLineBreak(byte))
   {
-    if (s_rx_line_len > 0U)
+    if (context->rx_line_len > 0U)
     {
-      s_rx_line[s_rx_line_len] = '\0';
-      BluetoothControl_QueueLineFromIsr(s_rx_line, &higher_priority_task_woken);
-      s_rx_line_len = 0U;
+      context->rx_line[context->rx_line_len] = '\0';
+      BluetoothControl_QueueLineFromIsr(context->rx_line, &higher_priority_task_woken);
+      context->rx_line_len = 0U;
     }
   }
   else if (BluetoothControl_IsPrintable(byte))
   {
-    if ((s_rx_line_len == 0U) && (byte >= (uint8_t)'0') && (byte <= (uint8_t)'3'))
+    if ((context->rx_line_len == 0U) && (byte >= (uint8_t)'0') && (byte <= (uint8_t)'3'))
     {
       completed_line.text[0] = (char)byte;
       completed_line.text[1] = '\0';
       BluetoothControl_QueueLineFromIsr(completed_line.text, &higher_priority_task_woken);
     }
-    else if ((s_rx_line_len == 1U) && (s_rx_line[0] == '9') && (byte == (uint8_t)'1'))
+    else if ((context->rx_line_len == 1U) && (context->rx_line[0] == '9') && (byte == (uint8_t)'1'))
     {
       BluetoothControl_QueueLineFromIsr("91", &higher_priority_task_woken);
-      s_rx_line_len = 0U;
+      context->rx_line_len = 0U;
     }
-    else if (s_rx_line_len < (BLUETOOTH_LINE_MAX - 1U))
+    else if (context->rx_line_len < (BLUETOOTH_LINE_MAX - 1U))
     {
-      s_rx_line[s_rx_line_len++] = (char)byte;
+      context->rx_line[context->rx_line_len++] = (char)byte;
     }
     else
     {
-      s_rx_line_len = 0U;
+      context->rx_line_len = 0U;
       s_state.rx_overflows++;
     }
   }
 
-  s_state.ready = BluetoothControl_StartReceive();
+  s_state.ready = BluetoothControl_StartReceiveContext(context);
   portYIELD_FROM_ISR(higher_priority_task_woken);
 }
 
 void BluetoothControl_OnUartErrorFromIsr(UART_HandleTypeDef *huart)
 {
-  if ((huart == NULL) || (huart->Instance != USART6))
+  BluetoothRxContext_t *context = BluetoothControl_GetRxContext(huart);
+
+  if (context == NULL)
   {
     return;
   }
 
   s_state.uart_errors++;
-  s_state.ready = BluetoothControl_StartReceive();
+  s_state.ready = BluetoothControl_StartReceiveContext(context);
 }
 
 static bool BluetoothControl_StartReceive(void)
 {
-  return (HAL_UART_Receive_IT(&huart6, &s_rx_byte, 1U) == HAL_OK);
+  bool ok = true;
+
+  ok = BluetoothControl_StartReceiveContext(&s_rx_uart6) && ok;
+  ok = BluetoothControl_StartReceiveContext(&s_rx_uart2) && ok;
+  return ok;
+}
+
+static bool BluetoothControl_StartReceiveContext(BluetoothRxContext_t *context)
+{
+  if ((context == NULL) || (context->huart == NULL))
+  {
+    return false;
+  }
+
+  return (HAL_UART_Receive_IT(context->huart, &context->rx_byte, 1U) == HAL_OK);
+}
+
+static BluetoothRxContext_t *BluetoothControl_GetRxContext(UART_HandleTypeDef *huart)
+{
+  if (huart == NULL)
+  {
+    return NULL;
+  }
+
+  if (huart->Instance == USART6)
+  {
+    return &s_rx_uart6;
+  }
+
+  if (huart->Instance == USART2)
+  {
+    return &s_rx_uart2;
+  }
+
+  return NULL;
 }
 
 static void BluetoothControl_ProcessLine(const BluetoothLine_t *line)
@@ -392,6 +456,22 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
     return BLUETOOTH_CMD_AUTO_MAPPING_OFF;
   }
 
+  if ((strcmp(line, "98") == 0) ||
+      (strcmp(line, "SLAM") == 0) ||
+      (strcmp(line, "SLAM ON") == 0) ||
+      (strcmp(line, "ASTAR") == 0) ||
+      (strcmp(line, "ASTAR ON") == 0))
+  {
+    return BLUETOOTH_CMD_SLAM_NAV_ON;
+  }
+
+  if ((strcmp(line, "99") == 0) ||
+      (strcmp(line, "SLAM OFF") == 0) ||
+      (strcmp(line, "ASTAR OFF") == 0))
+  {
+    return BLUETOOTH_CMD_SLAM_NAV_OFF;
+  }
+
   if (BluetoothControl_IsTurnDegreeCommand(line, 'L') ||
       BluetoothControl_IsTurnDegreeCommand(line, 'A'))
   {
@@ -478,11 +558,14 @@ static void BluetoothControl_ApplyCommand(BluetoothCommandType_t command)
 {
   s_state.last_command = command;
 
-  if (command == BLUETOOTH_CMD_START_MAPPING)
+  if ((command == BLUETOOTH_CMD_START_MAPPING) ||
+      (command == BLUETOOTH_CMD_SLAM_NAV_ON))
   {
     s_state.mapping_active = true;
   }
-  else if ((command == BLUETOOTH_CMD_STOP_ALL) || (command == BLUETOOTH_CMD_DRIVE_STOP))
+  else if ((command == BLUETOOTH_CMD_STOP_ALL) ||
+           (command == BLUETOOTH_CMD_DRIVE_STOP) ||
+           (command == BLUETOOTH_CMD_SLAM_NAV_OFF))
   {
     s_state.mapping_active = false;
   }

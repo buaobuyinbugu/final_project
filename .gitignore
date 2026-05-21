@@ -1,3 +1,7 @@
 build
 mx.scratch
 !.settings
+plan/
+.venv/
+.vscode/
+.settings/
