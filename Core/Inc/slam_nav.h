@@ -19,6 +19,7 @@ typedef enum
 
 bool SlamNav_Init(void);
 void SlamNav_StartExplore(void);
+void SlamNav_StartReturnTo(int32_t goal_x_mm, int32_t goal_y_mm);
 void SlamNav_Stop(void);
 bool SlamNav_IsActive(void);
 SlamNavState_t SlamNav_GetState(void);

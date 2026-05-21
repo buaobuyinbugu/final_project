@@ -255,6 +255,7 @@ static void TestApp_UpdateDisplay(void);
 static void TestApp_HandleBluetoothCommands(void);
 static void TestApp_UpdateMotorSpeedFromAdc(void);
 static void TestApp_StartMapping(void);
+static void TestApp_ResumeMapping(void);
 static void TestApp_StopMapping(void);
 static void TestApp_ProcessLidarPoints(void);
 static void TestApp_SendLidarDebugPoint(const LidarPoint_t *point);
@@ -989,6 +990,15 @@ static void TestApp_HandleBluetoothCommands(void)
         (void)BluetoothControl_SendText("SLAM STOP\r\n");
         break;
 
+      case BLUETOOTH_CMD_SLAM_NAV_RETURN:
+        TestApp_StopAutoMapping();
+        TestApp_StopAngleTurn(false);
+        MotorControl_Stop();
+        TestApp_ResumeMapping();
+        SlamNav_SetControlConfig(GetDrivePwmPermille(), GetTurnPwmPermille(), GetObstacleSafeDistanceMm());
+        SlamNav_StartReturnTo(MAPPING_START_X_MM, MAPPING_START_Y_MM);
+        break;
+
       case BLUETOOTH_CMD_TURN_LEFT_DEG:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
@@ -1037,6 +1047,30 @@ static void TestApp_StartMapping(void)
   next_map_tx_row = 0U;
 
   TestApp_SendMapHeader("START");
+}
+
+static void TestApp_ResumeMapping(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  if (mapping_active)
+  {
+    return;
+  }
+
+  mapping_active = true;
+  last_mapping_pose_tick_ms = now;
+  if (mapping_start_tick_ms == 0U)
+  {
+    mapping_start_tick_ms = now;
+  }
+  TestApp_RecordPoseHistory(now);
+  last_map_row_tx_tick_ms = 0U;
+  last_map_stat_tx_tick_ms = 0U;
+  last_pose_tx_tick_ms = 0U;
+  next_map_tx_row = 0U;
+
+  TestApp_SendMapHeader("RESUME");
 }
 
 static void TestApp_StopMapping(void)
@@ -2120,17 +2154,20 @@ static void TestApp_SendMapHeader(const char *state)
 static void TestApp_SendMapStat(void)
 {
   MappingGridStats_t stats;
-  char line[192];
+  BluetoothControlState_t bt_state = {0};
+  char line[224];
 
   if (!MappingGrid_GetStats(&stats))
   {
     return;
   }
 
+  (void)BluetoothControl_GetState(&bt_state);
+
   (void)snprintf(
       line,
       sizeof(line),
-      "MAP STAT active=%u rev=%lu inserted=%lu rejected=%lu unknown=%u free=%u occupied=%u clipped=%lu drops=%lu pose=%ld,%ld,%ld\r\n",
+      "MAP STAT active=%u rev=%lu inserted=%lu rejected=%lu unknown=%u free=%u occupied=%u clipped=%lu drops=%lu txdrop=%lu pose=%ld,%ld,%ld\r\n",
       mapping_active ? 1U : 0U,
       (unsigned long)stats.revision,
       (unsigned long)stats.inserted_points,
@@ -2140,6 +2177,7 @@ static void TestApp_SendMapStat(void)
       (unsigned int)stats.occupied_cells,
       (unsigned long)stats.clipped_rays,
       (unsigned long)LidarPipeline_GetPointQueueDrops(),
+      (unsigned long)bt_state.tx_drops,
       (long)mapping_pose.x_mm,
       (long)mapping_pose.y_mm,
       (long)mapping_pose.heading_cdeg);

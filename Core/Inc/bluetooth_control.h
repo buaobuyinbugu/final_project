@@ -24,6 +24,7 @@ typedef enum
   BLUETOOTH_CMD_AUTO_MAPPING_OFF,
   BLUETOOTH_CMD_SLAM_NAV_ON,
   BLUETOOTH_CMD_SLAM_NAV_OFF,
+  BLUETOOTH_CMD_SLAM_NAV_RETURN,
   BLUETOOTH_CMD_TURN_LEFT_DEG,
   BLUETOOTH_CMD_TURN_RIGHT_DEG,
   BLUETOOTH_CMD_DRIVE_FORWARD,
@@ -53,6 +54,7 @@ typedef struct
   uint32_t command_drops;
   uint32_t uart_errors;
   uint32_t tx_count;
+  uint32_t tx_drops;
   uint32_t last_rx_tick_ms;
   uint32_t last_tx_tick_ms;
   char last_line[BLUETOOTH_LINE_MAX];

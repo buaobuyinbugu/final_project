@@ -12,6 +12,11 @@ extern UART_HandleTypeDef huart6;
 
 #define BLUETOOTH_RX_LINE_QUEUE_LENGTH 4U
 #define BLUETOOTH_COMMAND_QUEUE_LENGTH 8U
+#define BLUETOOTH_TX_LINE_QUEUE_LENGTH 32U
+#define BLUETOOTH_TX_LINE_MAX          256U
+#define BLUETOOTH_TX_TASK_STACK_WORDS  384U
+#define BLUETOOTH_TX_TASK_PRIORITY     (tskIDLE_PRIORITY + 1U)
+#define BLUETOOTH_TX_TIMEOUT_MS        30U
 #define BLUETOOTH_RETRY_RX_MS          1000U
 #define BLUETOOTH_RX_ONLY_DEBUG        0U
 
@@ -29,6 +34,11 @@ typedef struct
   uint8_t rx_line_len;
 } BluetoothRxContext_t;
 
+typedef struct
+{
+  char text[BLUETOOTH_TX_LINE_MAX];
+} BluetoothTxLine_t;
+
 static StaticQueue_t s_rx_line_queue_struct;
 static uint8_t s_rx_line_queue_storage[BLUETOOTH_RX_LINE_QUEUE_LENGTH * sizeof(BluetoothLine_t)];
 static QueueHandle_t s_rx_line_queue;
@@ -36,6 +46,14 @@ static QueueHandle_t s_rx_line_queue;
 static StaticQueue_t s_command_queue_struct;
 static uint8_t s_command_queue_storage[BLUETOOTH_COMMAND_QUEUE_LENGTH * sizeof(BluetoothCommand_t)];
 static QueueHandle_t s_command_queue;
+
+static StaticQueue_t s_tx_line_queue_struct;
+static uint8_t s_tx_line_queue_storage[BLUETOOTH_TX_LINE_QUEUE_LENGTH * sizeof(BluetoothTxLine_t)];
+static QueueHandle_t s_tx_line_queue;
+
+static StaticTask_t s_tx_task_struct;
+static StackType_t s_tx_task_stack[BLUETOOTH_TX_TASK_STACK_WORDS];
+static TaskHandle_t s_tx_task_handle;
 
 static BluetoothControlState_t s_state;
 static BluetoothRxContext_t s_rx_uart6;
@@ -46,7 +64,8 @@ static uint32_t s_last_rx_retry_tick_ms;
 static bool BluetoothControl_StartReceive(void);
 static bool BluetoothControl_StartReceiveContext(BluetoothRxContext_t *context);
 static BluetoothRxContext_t *BluetoothControl_GetRxContext(UART_HandleTypeDef *huart);
-static bool BluetoothControl_SendBytes(const uint8_t *data, uint16_t length);
+static bool BluetoothControl_SendBytesBlocking(const uint8_t *data, uint16_t length);
+static void BluetoothControl_TxTask(void *argument);
 static void BluetoothControl_ProcessLine(const BluetoothLine_t *line);
 static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line);
 static void BluetoothControl_NormalizeLine(const char *input, char *output, size_t output_size);
@@ -81,6 +100,23 @@ bool BluetoothControl_Init(void)
       s_command_queue_storage,
       &s_command_queue_struct);
   configASSERT(s_command_queue != NULL);
+
+  s_tx_line_queue = xQueueCreateStatic(
+      BLUETOOTH_TX_LINE_QUEUE_LENGTH,
+      sizeof(BluetoothTxLine_t),
+      s_tx_line_queue_storage,
+      &s_tx_line_queue_struct);
+  configASSERT(s_tx_line_queue != NULL);
+
+  s_tx_task_handle = xTaskCreateStatic(
+      BluetoothControl_TxTask,
+      "btTx",
+      BLUETOOTH_TX_TASK_STACK_WORDS,
+      NULL,
+      BLUETOOTH_TX_TASK_PRIORITY,
+      s_tx_task_stack,
+      &s_tx_task_struct);
+  configASSERT(s_tx_task_handle != NULL);
 
   s_initialized = true;
   s_rx_uart6.huart = &huart6;
@@ -137,6 +173,7 @@ bool BluetoothControl_GetState(BluetoothControlState_t *out_state)
 bool BluetoothControl_SendText(const char *text)
 {
   size_t length;
+  BluetoothTxLine_t tx_line;
 
   if (text == NULL)
   {
@@ -149,10 +186,31 @@ bool BluetoothControl_SendText(const char *text)
     return true;
   }
 
-  return BluetoothControl_SendBytes((const uint8_t *)text, (uint16_t)length);
+  if (s_tx_line_queue == NULL)
+  {
+    return BluetoothControl_SendBytesBlocking((const uint8_t *)text, (uint16_t)length);
+  }
+
+  if (length >= sizeof(tx_line.text))
+  {
+    length = sizeof(tx_line.text) - 1U;
+  }
+
+  memcpy(tx_line.text, text, length);
+  tx_line.text[length] = '\0';
+
+  if (xQueueSend(s_tx_line_queue, &tx_line, 0U) != pdPASS)
+  {
+    taskENTER_CRITICAL();
+    s_state.tx_drops++;
+    taskEXIT_CRITICAL();
+    return false;
+  }
+
+  return true;
 }
 
-static bool BluetoothControl_SendBytes(const uint8_t *data, uint16_t length)
+static bool BluetoothControl_SendBytesBlocking(const uint8_t *data, uint16_t length)
 {
   bool sent = false;
 
@@ -161,12 +219,12 @@ static bool BluetoothControl_SendBytes(const uint8_t *data, uint16_t length)
     return true;
   }
 
-  if (HAL_UART_Transmit(&huart6, (uint8_t *)data, length, 20U) == HAL_OK)
+  if (HAL_UART_Transmit(&huart6, (uint8_t *)data, length, BLUETOOTH_TX_TIMEOUT_MS) == HAL_OK)
   {
     sent = true;
   }
 
-  if (HAL_UART_Transmit(&huart2, (uint8_t *)data, length, 20U) == HAL_OK)
+  if (HAL_UART_Transmit(&huart2, (uint8_t *)data, length, BLUETOOTH_TX_TIMEOUT_MS) == HAL_OK)
   {
     sent = true;
   }
@@ -180,6 +238,24 @@ static bool BluetoothControl_SendBytes(const uint8_t *data, uint16_t length)
 
   s_state.ready = false;
   return false;
+}
+
+static void BluetoothControl_TxTask(void *argument)
+{
+  BluetoothTxLine_t tx_line;
+
+  (void)argument;
+
+  for (;;)
+  {
+    if ((s_tx_line_queue != NULL) &&
+        (xQueueReceive(s_tx_line_queue, &tx_line, portMAX_DELAY) == pdPASS))
+    {
+      (void)BluetoothControl_SendBytesBlocking(
+          (const uint8_t *)tx_line.text,
+          (uint16_t)strlen(tx_line.text));
+    }
+  }
 }
 
 const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
@@ -199,6 +275,7 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_AUTO_MAPPING_OFF:return "AUTO_MAPPING_OFF";
     case BLUETOOTH_CMD_SLAM_NAV_ON:     return "SLAM_NAV_ON";
     case BLUETOOTH_CMD_SLAM_NAV_OFF:    return "SLAM_NAV_OFF";
+    case BLUETOOTH_CMD_SLAM_NAV_RETURN: return "SLAM_NAV_RETURN";
     case BLUETOOTH_CMD_TURN_LEFT_DEG:   return "TURN_LEFT_DEG";
     case BLUETOOTH_CMD_TURN_RIGHT_DEG:  return "TURN_RIGHT_DEG";
     case BLUETOOTH_CMD_DRIVE_FORWARD:   return "DRIVE_FORWARD";
@@ -472,6 +549,19 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
     return BLUETOOTH_CMD_SLAM_NAV_OFF;
   }
 
+  if ((strcmp(line, "100") == 0) ||
+      (strcmp(line, "BACK") == 0) ||
+      (strcmp(line, "RETURN") == 0) ||
+      (strcmp(line, "HOME") == 0) ||
+      (strcmp(line, "GO HOME") == 0) ||
+      (strcmp(line, "SLAM BACK") == 0) ||
+      (strcmp(line, "SLAM RETURN") == 0) ||
+      (strcmp(line, "ASTAR BACK") == 0) ||
+      (strcmp(line, "ASTAR RETURN") == 0))
+  {
+    return BLUETOOTH_CMD_SLAM_NAV_RETURN;
+  }
+
   if (BluetoothControl_IsTurnDegreeCommand(line, 'L') ||
       BluetoothControl_IsTurnDegreeCommand(line, 'A'))
   {
@@ -559,7 +649,8 @@ static void BluetoothControl_ApplyCommand(BluetoothCommandType_t command)
   s_state.last_command = command;
 
   if ((command == BLUETOOTH_CMD_START_MAPPING) ||
-      (command == BLUETOOTH_CMD_SLAM_NAV_ON))
+      (command == BLUETOOTH_CMD_SLAM_NAV_ON) ||
+      (command == BLUETOOTH_CMD_SLAM_NAV_RETURN))
   {
     s_state.mapping_active = true;
   }

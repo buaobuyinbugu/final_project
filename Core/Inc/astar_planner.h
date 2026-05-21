@@ -37,6 +37,12 @@ AstarPlannerStatus_t AstarPlanner_PlanToFrontier(const MappingGridSnapshot_t *sn
                                                  uint8_t start_x,
                                                  uint8_t start_y,
                                                  AstarPlannerPath_t *out_path);
+AstarPlannerStatus_t AstarPlanner_PlanToGoal(const MappingGridSnapshot_t *snapshot,
+                                             uint8_t start_x,
+                                             uint8_t start_y,
+                                             uint8_t goal_x,
+                                             uint8_t goal_y,
+                                             AstarPlannerPath_t *out_path);
 const char *AstarPlanner_StatusName(AstarPlannerStatus_t status);
 
 #endif /* ASTAR_PLANNER_H */

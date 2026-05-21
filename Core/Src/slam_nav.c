@@ -31,16 +31,30 @@
 
 typedef enum
 {
-  SLAM_NAV_COMMAND_START = 0,
+  SLAM_NAV_COMMAND_START_EXPLORE = 0,
+  SLAM_NAV_COMMAND_START_RETURN,
   SLAM_NAV_COMMAND_STOP
 } SlamNavCommand_t;
+
+typedef enum
+{
+  SLAM_NAV_MODE_EXPLORE = 0,
+  SLAM_NAV_MODE_RETURN
+} SlamNavMode_t;
+
+typedef struct
+{
+  SlamNavCommand_t command;
+  int32_t goal_x_mm;
+  int32_t goal_y_mm;
+} SlamNavCommandMessage_t;
 
 static StaticTask_t s_nav_task_struct;
 static StackType_t s_nav_task_stack[SLAM_NAV_TASK_STACK_WORDS];
 static TaskHandle_t s_nav_task_handle;
 
 static StaticQueue_t s_command_queue_struct;
-static uint8_t s_command_queue_storage[SLAM_NAV_COMMAND_QUEUE_LENGTH * sizeof(SlamNavCommand_t)];
+static uint8_t s_command_queue_storage[SLAM_NAV_COMMAND_QUEUE_LENGTH * sizeof(SlamNavCommandMessage_t)];
 static QueueHandle_t s_command_queue;
 
 static MappingGridSnapshot_t s_snapshot;
@@ -48,6 +62,7 @@ static AstarPlannerPath_t s_path;
 
 static bool s_initialized;
 static bool s_active;
+static SlamNavMode_t s_mode = SLAM_NAV_MODE_EXPLORE;
 static SlamNavState_t s_state = SLAM_NAV_STATE_IDLE;
 static uint16_t s_drive_pwm_permille = SLAM_NAV_DEFAULT_DRIVE_PWM;
 static uint16_t s_turn_pwm_permille = SLAM_NAV_DEFAULT_TURN_PWM;
@@ -61,11 +76,13 @@ static int32_t s_target_y_mm;
 static int32_t s_target_heading_cdeg;
 static uint32_t s_plan_seq;
 static uint32_t s_last_heartbeat_tick_ms;
+static int32_t s_return_goal_x_mm;
+static int32_t s_return_goal_y_mm;
 
 static void SlamNav_Task(void *argument);
-static void SlamNav_HandleCommand(SlamNavCommand_t command);
+static void SlamNav_HandleCommand(const SlamNavCommandMessage_t *message);
 static void SlamNav_Update(void);
-static void SlamNav_StartInternal(void);
+static void SlamNav_StartInternal(SlamNavMode_t mode, int32_t goal_x_mm, int32_t goal_y_mm);
 static void SlamNav_StopInternal(const char *reason, bool send_status);
 static void SlamNav_UpdatePlan(void);
 static void SlamNav_UpdateTurn(void);
@@ -93,7 +110,7 @@ bool SlamNav_Init(void)
 
   s_command_queue = xQueueCreateStatic(
       SLAM_NAV_COMMAND_QUEUE_LENGTH,
-      sizeof(SlamNavCommand_t),
+      sizeof(SlamNavCommandMessage_t),
       s_command_queue_storage,
       &s_command_queue_struct);
   configASSERT(s_command_queue != NULL);
@@ -114,16 +131,39 @@ bool SlamNav_Init(void)
 
 void SlamNav_StartExplore(void)
 {
-  SlamNavCommand_t command = SLAM_NAV_COMMAND_START;
+  SlamNavCommandMessage_t message;
 
   if (!s_initialized)
   {
     (void)SlamNav_Init();
   }
 
+  message.command = SLAM_NAV_COMMAND_START_EXPLORE;
+  message.goal_x_mm = 0L;
+  message.goal_y_mm = 0L;
+
   if (s_command_queue != NULL)
   {
-    (void)xQueueSend(s_command_queue, &command, 0U);
+    (void)xQueueSend(s_command_queue, &message, 0U);
+  }
+}
+
+void SlamNav_StartReturnTo(int32_t goal_x_mm, int32_t goal_y_mm)
+{
+  SlamNavCommandMessage_t message;
+
+  if (!s_initialized)
+  {
+    (void)SlamNav_Init();
+  }
+
+  message.command = SLAM_NAV_COMMAND_START_RETURN;
+  message.goal_x_mm = goal_x_mm;
+  message.goal_y_mm = goal_y_mm;
+
+  if (s_command_queue != NULL)
+  {
+    (void)xQueueSend(s_command_queue, &message, 0U);
   }
 }
 
@@ -206,16 +246,16 @@ const char *SlamNav_StateName(SlamNavState_t state)
 
 static void SlamNav_Task(void *argument)
 {
-  SlamNavCommand_t command;
+  SlamNavCommandMessage_t message;
 
   (void)argument;
 
   for (;;)
   {
     while ((s_command_queue != NULL) &&
-           (xQueueReceive(s_command_queue, &command, 0U) == pdPASS))
+           (xQueueReceive(s_command_queue, &message, 0U) == pdPASS))
     {
-      SlamNav_HandleCommand(command);
+      SlamNav_HandleCommand(&message);
     }
 
     SlamNav_Update();
@@ -223,11 +263,20 @@ static void SlamNav_Task(void *argument)
   }
 }
 
-static void SlamNav_HandleCommand(SlamNavCommand_t command)
+static void SlamNav_HandleCommand(const SlamNavCommandMessage_t *message)
 {
-  if (command == SLAM_NAV_COMMAND_START)
+  if (message == NULL)
   {
-    SlamNav_StartInternal();
+    return;
+  }
+
+  if (message->command == SLAM_NAV_COMMAND_START_EXPLORE)
+  {
+    SlamNav_StartInternal(SLAM_NAV_MODE_EXPLORE, 0L, 0L);
+  }
+  else if (message->command == SLAM_NAV_COMMAND_START_RETURN)
+  {
+    SlamNav_StartInternal(SLAM_NAV_MODE_RETURN, message->goal_x_mm, message->goal_y_mm);
   }
   else
   {
@@ -271,20 +320,23 @@ static void SlamNav_Update(void)
   }
 }
 
-static void SlamNav_StartInternal(void)
+static void SlamNav_StartInternal(SlamNavMode_t mode, int32_t goal_x_mm, int32_t goal_y_mm)
 {
   taskENTER_CRITICAL();
   s_active = true;
+  s_mode = mode;
   s_state = SLAM_NAV_STATE_PLAN;
   s_front_blocked_until_ms = 0U;
   s_front_min_distance_mm = 0U;
   s_path_index = 0U;
   s_plan_seq = 0U;
   s_last_heartbeat_tick_ms = 0U;
+  s_return_goal_x_mm = goal_x_mm;
+  s_return_goal_y_mm = goal_y_mm;
   taskEXIT_CRITICAL();
 
   MotorControl_Stop();
-  SlamNav_SendStatus("START", "FRONTIER");
+  SlamNav_SendStatus("START", (mode == SLAM_NAV_MODE_RETURN) ? "RETURN" : "FRONTIER");
 }
 
 static void SlamNav_StopInternal(const char *reason, bool send_status)
@@ -294,6 +346,7 @@ static void SlamNav_StopInternal(const char *reason, bool send_status)
   taskENTER_CRITICAL();
   was_active = s_active;
   s_active = false;
+  s_mode = SLAM_NAV_MODE_EXPLORE;
   s_state = SLAM_NAV_STATE_IDLE;
   s_front_blocked_until_ms = 0U;
   s_front_min_distance_mm = 0U;
@@ -315,7 +368,12 @@ static void SlamNav_UpdatePlan(void)
   MappingGridPose_t pose;
   uint8_t start_x;
   uint8_t start_y;
+  uint8_t goal_x = 0U;
+  uint8_t goal_y = 0U;
   AstarPlannerStatus_t status;
+  SlamNavMode_t mode;
+  int32_t return_goal_x_mm;
+  int32_t return_goal_y_mm;
 
   if (!SlamNav_GetPoseAndCell(&pose, &start_x, &start_y))
   {
@@ -336,7 +394,43 @@ static void SlamNav_UpdatePlan(void)
     return;
   }
 
-  status = AstarPlanner_PlanToFrontier(&s_snapshot, start_x, start_y, &s_path);
+  taskENTER_CRITICAL();
+  mode = s_mode;
+  return_goal_x_mm = s_return_goal_x_mm;
+  return_goal_y_mm = s_return_goal_y_mm;
+  taskEXIT_CRITICAL();
+
+  if (mode == SLAM_NAV_MODE_RETURN)
+  {
+    if (!MappingGrid_WorldToCell(return_goal_x_mm, return_goal_y_mm, &goal_x, &goal_y))
+    {
+      s_state = SLAM_NAV_STATE_NO_PATH;
+      s_active = false;
+      MotorControl_Stop();
+      SlamNav_SendStatus("NO_PATH", "RETURN_GOAL");
+      return;
+    }
+
+    if ((start_x == goal_x) && (start_y == goal_y))
+    {
+      s_state = SLAM_NAV_STATE_DONE;
+      s_active = false;
+      MotorControl_Stop();
+      s_path.length = 1U;
+      s_path.target.x = goal_x;
+      s_path.target.y = goal_y;
+      s_current_target_cell = s_path.target;
+      SlamNav_SendStatus("DONE", "RETURN_HOME");
+      return;
+    }
+
+    status = AstarPlanner_PlanToGoal(&s_snapshot, start_x, start_y, goal_x, goal_y, &s_path);
+  }
+  else
+  {
+    status = AstarPlanner_PlanToFrontier(&s_snapshot, start_x, start_y, &s_path);
+  }
+
   s_plan_seq++;
   if (((status != ASTAR_PLANNER_STATUS_OK) &&
        (status != ASTAR_PLANNER_STATUS_PATH_TRUNCATED)) ||
@@ -360,7 +454,7 @@ static void SlamNav_UpdatePlan(void)
 
   s_state = SLAM_NAV_STATE_TURN;
   SlamNav_SendPath();
-  SlamNav_SendStatus("PLAN", AstarPlanner_StatusName(status));
+  SlamNav_SendStatus((mode == SLAM_NAV_MODE_RETURN) ? "RETURN" : "PLAN", AstarPlanner_StatusName(status));
 }
 
 static void SlamNav_UpdateTurn(void)

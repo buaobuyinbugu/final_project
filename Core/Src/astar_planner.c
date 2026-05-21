@@ -34,12 +34,12 @@ static uint8_t Astar_CollectFrontierCandidates(const MappingGridSnapshot_t *snap
                                                uint8_t start_x,
                                                uint8_t start_y);
 static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t *count);
-static AstarPlannerStatus_t Astar_PlanToGoal(const MappingGridSnapshot_t *snapshot,
-                                             uint8_t start_x,
-                                             uint8_t start_y,
-                                             uint8_t goal_x,
-                                             uint8_t goal_y,
-                                             AstarPlannerPath_t *out_path);
+static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snapshot,
+                                               uint8_t start_x,
+                                               uint8_t start_y,
+                                               uint8_t goal_x,
+                                               uint8_t goal_y,
+                                               AstarPlannerPath_t *out_path);
 static bool Astar_ReconstructPath(uint16_t start_index,
                                   uint16_t goal_index,
                                   AstarPlannerPath_t *out_path);
@@ -84,7 +84,7 @@ AstarPlannerStatus_t AstarPlanner_PlanToFrontier(const MappingGridSnapshot_t *sn
     AstarPlannerStatus_t status;
 
     Astar_Cell(s_frontier_candidates[i].index, &goal_x, &goal_y);
-    status = Astar_PlanToGoal(snapshot, start_x, start_y, goal_x, goal_y, out_path);
+    status = Astar_SearchToGoal(snapshot, start_x, start_y, goal_x, goal_y, out_path);
     if ((status == ASTAR_PLANNER_STATUS_OK) ||
         (status == ASTAR_PLANNER_STATUS_PATH_TRUNCATED))
     {
@@ -97,6 +97,46 @@ AstarPlannerStatus_t AstarPlanner_PlanToFrontier(const MappingGridSnapshot_t *sn
 
   out_path->status = ASTAR_PLANNER_STATUS_NO_PATH;
   return out_path->status;
+}
+
+AstarPlannerStatus_t AstarPlanner_PlanToGoal(const MappingGridSnapshot_t *snapshot,
+                                             uint8_t start_x,
+                                             uint8_t start_y,
+                                             uint8_t goal_x,
+                                             uint8_t goal_y,
+                                             AstarPlannerPath_t *out_path)
+{
+  AstarPlannerStatus_t status;
+
+  if ((snapshot == NULL) || (out_path == NULL))
+  {
+    return ASTAR_PLANNER_STATUS_BAD_ARGUMENT;
+  }
+
+  memset(out_path, 0, sizeof(*out_path));
+  out_path->status = ASTAR_PLANNER_STATUS_NO_PATH;
+
+  if ((start_x >= MAPPING_GRID_WIDTH_CELLS) ||
+      (start_y >= MAPPING_GRID_HEIGHT_CELLS) ||
+      !Astar_IsFree(snapshot, start_x, start_y))
+  {
+    out_path->status = ASTAR_PLANNER_STATUS_BAD_START;
+    return out_path->status;
+  }
+
+  if ((goal_x >= MAPPING_GRID_WIDTH_CELLS) ||
+      (goal_y >= MAPPING_GRID_HEIGHT_CELLS) ||
+      !Astar_IsFree(snapshot, goal_x, goal_y))
+  {
+    out_path->status = ASTAR_PLANNER_STATUS_NO_PATH;
+    return out_path->status;
+  }
+
+  status = Astar_SearchToGoal(snapshot, start_x, start_y, goal_x, goal_y, out_path);
+  out_path->target.x = goal_x;
+  out_path->target.y = goal_y;
+  out_path->status = status;
+  return status;
 }
 
 const char *AstarPlanner_StatusName(AstarPlannerStatus_t status)
@@ -280,12 +320,12 @@ static void Astar_InsertCandidate(uint16_t index, uint16_t distance, uint8_t *co
   s_frontier_candidates[pos].distance = distance;
 }
 
-static AstarPlannerStatus_t Astar_PlanToGoal(const MappingGridSnapshot_t *snapshot,
-                                             uint8_t start_x,
-                                             uint8_t start_y,
-                                             uint8_t goal_x,
-                                             uint8_t goal_y,
-                                             AstarPlannerPath_t *out_path)
+static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snapshot,
+                                               uint8_t start_x,
+                                               uint8_t start_y,
+                                               uint8_t goal_x,
+                                               uint8_t goal_y,
+                                               AstarPlannerPath_t *out_path)
 {
   static const int8_t offsets[4][2] = {
       {1, 0},
