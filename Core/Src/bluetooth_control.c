@@ -17,6 +17,7 @@ extern UART_HandleTypeDef huart6;
 #define BLUETOOTH_TX_TASK_STACK_WORDS  384U
 #define BLUETOOTH_TX_TASK_PRIORITY     (tskIDLE_PRIORITY + 1U)
 #define BLUETOOTH_TX_TIMEOUT_MS        30U
+#define BLUETOOTH_RX_LINE_IDLE_MS      120U
 #define BLUETOOTH_RETRY_RX_MS          1000U
 #define BLUETOOTH_RX_ONLY_DEBUG        0U
 
@@ -32,6 +33,7 @@ typedef struct
   uint8_t rx_byte;
   char rx_line[BLUETOOTH_LINE_MAX];
   uint8_t rx_line_len;
+  uint32_t last_byte_tick_ms;
 } BluetoothRxContext_t;
 
 typedef struct
@@ -65,7 +67,12 @@ static bool BluetoothControl_StartReceive(void);
 static bool BluetoothControl_StartReceiveContext(BluetoothRxContext_t *context);
 static BluetoothRxContext_t *BluetoothControl_GetRxContext(UART_HandleTypeDef *huart);
 static bool BluetoothControl_SendBytesBlocking(const uint8_t *data, uint16_t length);
+static bool BluetoothControl_ShouldSendToBluetooth(const uint8_t *data, uint16_t length);
+static bool BluetoothControl_HasPrefix(const uint8_t *data, uint16_t length, const char *prefix);
 static void BluetoothControl_TxTask(void *argument);
+static void BluetoothControl_FlushIdleRxLines(uint32_t now);
+static void BluetoothControl_FlushIdleRxContext(BluetoothRxContext_t *context, uint32_t now);
+static void BluetoothControl_QueueLine(const char *text, uint32_t tick_ms);
 static void BluetoothControl_ProcessLine(const BluetoothLine_t *line);
 static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line);
 static void BluetoothControl_NormalizeLine(const char *input, char *output, size_t output_size);
@@ -145,6 +152,8 @@ void BluetoothControl_Update(void)
   {
     BluetoothControl_ProcessLine(&line);
   }
+
+  BluetoothControl_FlushIdleRxLines(now);
 }
 
 bool BluetoothControl_TakeCommand(BluetoothCommand_t *out_command)
@@ -219,7 +228,8 @@ static bool BluetoothControl_SendBytesBlocking(const uint8_t *data, uint16_t len
     return true;
   }
 
-  if (HAL_UART_Transmit(&huart6, (uint8_t *)data, length, BLUETOOTH_TX_TIMEOUT_MS) == HAL_OK)
+  if (BluetoothControl_ShouldSendToBluetooth(data, length) &&
+      (HAL_UART_Transmit(&huart6, (uint8_t *)data, length, BLUETOOTH_TX_TIMEOUT_MS) == HAL_OK))
   {
     sent = true;
   }
@@ -238,6 +248,42 @@ static bool BluetoothControl_SendBytesBlocking(const uint8_t *data, uint16_t len
 
   s_state.ready = false;
   return false;
+}
+
+static bool BluetoothControl_ShouldSendToBluetooth(const uint8_t *data, uint16_t length)
+{
+  if ((data == NULL) || (length == 0U))
+  {
+    return true;
+  }
+
+  if (BluetoothControl_HasPrefix(data, length, "MAP ROW ") ||
+      BluetoothControl_HasPrefix(data, length, "POSE ") ||
+      BluetoothControl_HasPrefix(data, length, "PATH CHUNK ") ||
+      BluetoothControl_HasPrefix(data, length, "LP "))
+  {
+    return false;
+  }
+
+  return true;
+}
+
+static bool BluetoothControl_HasPrefix(const uint8_t *data, uint16_t length, const char *prefix)
+{
+  size_t prefix_len;
+
+  if ((data == NULL) || (prefix == NULL))
+  {
+    return false;
+  }
+
+  prefix_len = strlen(prefix);
+  if (length < prefix_len)
+  {
+    return false;
+  }
+
+  return (strncmp((const char *)data, prefix, prefix_len) == 0);
 }
 
 static void BluetoothControl_TxTask(void *argument)
@@ -304,6 +350,7 @@ void BluetoothControl_OnUartRxCpltFromIsr(UART_HandleTypeDef *huart)
   byte = context->rx_byte;
   s_state.rx_bytes++;
   s_state.last_rx_tick_ms = HAL_GetTick();
+  context->last_byte_tick_ms = s_state.last_rx_tick_ms;
 
   if (BluetoothControl_IsLineBreak(byte))
   {
@@ -316,7 +363,8 @@ void BluetoothControl_OnUartRxCpltFromIsr(UART_HandleTypeDef *huart)
   }
   else if (BluetoothControl_IsPrintable(byte))
   {
-    if ((context->rx_line_len == 0U) && (byte >= (uint8_t)'0') && (byte <= (uint8_t)'3'))
+    if ((context->rx_line_len == 0U) &&
+        ((byte == (uint8_t)'0') || (byte == (uint8_t)'2') || (byte == (uint8_t)'3')))
     {
       completed_line.text[0] = (char)byte;
       completed_line.text[1] = '\0';
@@ -392,6 +440,69 @@ static BluetoothRxContext_t *BluetoothControl_GetRxContext(UART_HandleTypeDef *h
   }
 
   return NULL;
+}
+
+static void BluetoothControl_FlushIdleRxLines(uint32_t now)
+{
+  BluetoothControl_FlushIdleRxContext(&s_rx_uart6, now);
+  BluetoothControl_FlushIdleRxContext(&s_rx_uart2, now);
+}
+
+static void BluetoothControl_FlushIdleRxContext(BluetoothRxContext_t *context, uint32_t now)
+{
+  char line[BLUETOOTH_LINE_MAX];
+  uint8_t length;
+  uint32_t tick_ms;
+
+  if ((context == NULL) || (context->rx_line_len == 0U))
+  {
+    return;
+  }
+
+  if ((now - context->last_byte_tick_ms) < BLUETOOTH_RX_LINE_IDLE_MS)
+  {
+    return;
+  }
+
+  taskENTER_CRITICAL();
+  if ((context->rx_line_len == 0U) ||
+      ((now - context->last_byte_tick_ms) < BLUETOOTH_RX_LINE_IDLE_MS))
+  {
+    taskEXIT_CRITICAL();
+    return;
+  }
+
+  length = context->rx_line_len;
+  if (length >= BLUETOOTH_LINE_MAX)
+  {
+    length = BLUETOOTH_LINE_MAX - 1U;
+  }
+  memcpy(line, context->rx_line, length);
+  line[length] = '\0';
+  tick_ms = context->last_byte_tick_ms;
+  context->rx_line_len = 0U;
+  taskEXIT_CRITICAL();
+
+  BluetoothControl_QueueLine(line, tick_ms);
+}
+
+static void BluetoothControl_QueueLine(const char *text, uint32_t tick_ms)
+{
+  BluetoothLine_t completed_line;
+
+  if ((text == NULL) || (s_rx_line_queue == NULL))
+  {
+    return;
+  }
+
+  completed_line.tick_ms = tick_ms;
+  memset(completed_line.text, 0, sizeof(completed_line.text));
+  strncpy(completed_line.text, text, sizeof(completed_line.text) - 1U);
+
+  if (xQueueSend(s_rx_line_queue, &completed_line, 0U) != pdPASS)
+  {
+    s_state.command_drops++;
+  }
 }
 
 static void BluetoothControl_ProcessLine(const BluetoothLine_t *line)
@@ -574,9 +685,13 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
     return BLUETOOTH_CMD_TURN_RIGHT_DEG;
   }
 
+  if (strcmp(line, "GO") == 0)
+  {
+    return BLUETOOTH_CMD_SLAM_NAV_ON;
+  }
+
   if ((strcmp(line, "FWD") == 0) ||
-      (strcmp(line, "FORWARD") == 0) ||
-      (strcmp(line, "GO") == 0))
+      (strcmp(line, "FORWARD") == 0))
   {
     return BLUETOOTH_CMD_DRIVE_FORWARD;
   }
