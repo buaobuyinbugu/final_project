@@ -18,13 +18,16 @@
 #define SLAM_NAV_TASK_PERIOD_MS         20U
 #define SLAM_NAV_DEFAULT_DRIVE_PWM      450U
 #define SLAM_NAV_DEFAULT_TURN_PWM       450U
-#define SLAM_NAV_DEFAULT_SAFE_MM        180U
+#define SLAM_NAV_DEFAULT_SAFE_MM        250U
 #define SLAM_NAV_MAX_PWM                1000U
-#define SLAM_NAV_FRONT_SECTOR_CDEG      1500U
-#define SLAM_NAV_FRONT_BLOCK_HOLD_MS    250U
-#define SLAM_NAV_TURN_TOL_CDEG          800L
-#define SLAM_NAV_DRIVE_HEADING_TOL_CDEG 1800L
-#define SLAM_NAV_TARGET_RADIUS_MM       30L
+#define SLAM_NAV_MIN_SAFE_MM            250U
+#define SLAM_NAV_MIN_DRIVE_PWM          380U
+#define SLAM_NAV_MIN_TURN_PWM           380U
+#define SLAM_NAV_FRONT_SECTOR_CDEG      3000U
+#define SLAM_NAV_FRONT_BLOCK_HOLD_MS    600U
+#define SLAM_NAV_TURN_TOL_CDEG          1200L
+#define SLAM_NAV_DRIVE_HEADING_TOL_CDEG 2600L
+#define SLAM_NAV_TARGET_RADIUS_MM       40L
 #define SLAM_NAV_ROBOT_FREE_RADIUS      1U
 #define SLAM_NAV_HEARTBEAT_INTERVAL_MS  500U
 #define SLAM_NAV_PATH_CHUNK_CELLS       10U
@@ -95,7 +98,7 @@ static int32_t SlamNav_NormalizeHeadingCdeg(int32_t heading_cdeg);
 static int32_t SlamNav_SignedHeadingErrorCdeg(int32_t target_cdeg, int32_t current_cdeg);
 static int32_t SlamNav_Abs32(int32_t value);
 static uint16_t SlamNav_ClampPwm(uint16_t value);
-static uint16_t SlamNav_ActivePwm(uint16_t configured_pwm, uint16_t fallback_pwm);
+static uint16_t SlamNav_ActivePwm(uint16_t configured_pwm, uint16_t fallback_pwm, uint16_t minimum_pwm);
 static int32_t SlamNav_CellHeadingCdeg(const AstarPlannerCell_t *from, const AstarPlannerCell_t *to);
 static void SlamNav_SendStatus(const char *state, const char *reason);
 static void SlamNav_SendHeartbeatIfDue(void);
@@ -199,7 +202,7 @@ void SlamNav_SetControlConfig(uint16_t drive_pwm_permille,
   taskENTER_CRITICAL();
   s_drive_pwm_permille = SlamNav_ClampPwm(drive_pwm_permille);
   s_turn_pwm_permille = SlamNav_ClampPwm(turn_pwm_permille);
-  s_safe_distance_mm = safe_distance_mm;
+  s_safe_distance_mm = (safe_distance_mm < SLAM_NAV_MIN_SAFE_MM) ? SLAM_NAV_MIN_SAFE_MM : safe_distance_mm;
   taskEXIT_CRITICAL();
 }
 
@@ -477,8 +480,8 @@ static void SlamNav_UpdateTurn(void)
     return;
   }
 
-  turn_pwm = SlamNav_ActivePwm(s_turn_pwm_permille, SLAM_NAV_DEFAULT_TURN_PWM);
-  if (error_cdeg < 0L)
+  turn_pwm = SlamNav_ActivePwm(s_turn_pwm_permille, SLAM_NAV_DEFAULT_TURN_PWM, SLAM_NAV_MIN_TURN_PWM);
+  if (error_cdeg > 0L)
   {
     MotorControl_SetTurnLeft(turn_pwm);
   }
@@ -532,7 +535,7 @@ static void SlamNav_UpdateDrive(void)
     return;
   }
 
-  MotorControl_SetForward(SlamNav_ActivePwm(s_drive_pwm_permille, SLAM_NAV_DEFAULT_DRIVE_PWM));
+  MotorControl_SetForward(SlamNav_ActivePwm(s_drive_pwm_permille, SLAM_NAV_DEFAULT_DRIVE_PWM, SLAM_NAV_MIN_DRIVE_PWM));
 }
 
 static bool SlamNav_GetPoseAndCell(MappingGridPose_t *out_pose, uint8_t *out_x, uint8_t *out_y)
@@ -641,9 +644,16 @@ static uint16_t SlamNav_ClampPwm(uint16_t value)
   return (value > SLAM_NAV_MAX_PWM) ? SLAM_NAV_MAX_PWM : value;
 }
 
-static uint16_t SlamNav_ActivePwm(uint16_t configured_pwm, uint16_t fallback_pwm)
+static uint16_t SlamNav_ActivePwm(uint16_t configured_pwm, uint16_t fallback_pwm, uint16_t minimum_pwm)
 {
-  return (configured_pwm > 0U) ? configured_pwm : fallback_pwm;
+  uint16_t pwm = (configured_pwm > 0U) ? configured_pwm : fallback_pwm;
+
+  if ((pwm > 0U) && (pwm < minimum_pwm))
+  {
+    pwm = minimum_pwm;
+  }
+
+  return pwm;
 }
 
 static int32_t SlamNav_CellHeadingCdeg(const AstarPlannerCell_t *from, const AstarPlannerCell_t *to)

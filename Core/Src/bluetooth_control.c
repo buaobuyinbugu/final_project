@@ -322,6 +322,7 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_SLAM_NAV_ON:     return "SLAM_NAV_ON";
     case BLUETOOTH_CMD_SLAM_NAV_OFF:    return "SLAM_NAV_OFF";
     case BLUETOOTH_CMD_SLAM_NAV_RETURN: return "SLAM_NAV_RETURN";
+    case BLUETOOTH_CMD_GYRO_CALIBRATE:  return "GYRO_CALIBRATE";
     case BLUETOOTH_CMD_TURN_LEFT_DEG:   return "TURN_LEFT_DEG";
     case BLUETOOTH_CMD_TURN_RIGHT_DEG:  return "TURN_RIGHT_DEG";
     case BLUETOOTH_CMD_DRIVE_FORWARD:   return "DRIVE_FORWARD";
@@ -671,6 +672,18 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
       (strcmp(line, "ASTAR RETURN") == 0))
   {
     return BLUETOOTH_CMD_SLAM_NAV_RETURN;
+  }
+
+  if ((strcmp(line, "CAL") == 0) ||
+      (strcmp(line, "CAL MPU") == 0) ||
+      (strcmp(line, "CAL GYRO") == 0) ||
+      (strcmp(line, "GYRO CAL") == 0) ||
+      (strcmp(line, "GYRO CALIBRATE") == 0) ||
+      (strcmp(line, "IMU CAL") == 0) ||
+      (strcmp(line, "MPU CAL") == 0) ||
+      (strcmp(line, "MPU CALIBRATE") == 0))
+  {
+    return BLUETOOTH_CMD_GYRO_CALIBRATE;
   }
 
   if (BluetoothControl_IsTurnDegreeCommand(line, 'L') ||
