@@ -309,6 +309,7 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
   switch (command)
   {
     case BLUETOOTH_CMD_START_MAPPING:   return "START_MAPPING";
+    case BLUETOOTH_CMD_STOP_MAPPING:    return "STOP_MAPPING";
     case BLUETOOTH_CMD_STOP_ALL:        return "STOP_ALL";
     case BLUETOOTH_CMD_SHOW_MAP_RESULT: return "SHOW_MAP";
     case BLUETOOTH_CMD_DEBUG_ON:        return "DEBUG_ON";
@@ -323,6 +324,9 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_SLAM_NAV_OFF:    return "SLAM_NAV_OFF";
     case BLUETOOTH_CMD_SLAM_NAV_RETURN: return "SLAM_NAV_RETURN";
     case BLUETOOTH_CMD_GYRO_CALIBRATE:  return "GYRO_CALIBRATE";
+    case BLUETOOTH_CMD_MPU_STATE:       return "MPU_STATE";
+    case BLUETOOTH_CMD_LIDAR_FRONT_STATE:return "LIDAR_FRONT_STATE";
+    case BLUETOOTH_CMD_DIR_STATE:       return "DIR_STATE";
     case BLUETOOTH_CMD_TURN_LEFT_DEG:   return "TURN_LEFT_DEG";
     case BLUETOOTH_CMD_TURN_RIGHT_DEG:  return "TURN_RIGHT_DEG";
     case BLUETOOTH_CMD_DRIVE_FORWARD:   return "DRIVE_FORWARD";
@@ -543,6 +547,11 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
     return BLUETOOTH_CMD_START_MAPPING;
   }
 
+  if (strcmp(line, "97") == 0)
+  {
+    return BLUETOOTH_CMD_STOP_MAPPING;
+  }
+
   if (strcmp(line, "1") == 0)
   {
     return BLUETOOTH_CMD_DRIVE_FORWARD;
@@ -570,11 +579,27 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
     return BLUETOOTH_CMD_START_MAPPING;
   }
 
-  if ((strcmp(line, "STOP") == 0) ||
-      (strcmp(line, "HALT") == 0) ||
-      (strcmp(line, "MAP STOP") == 0))
+  if ((strcmp(line, "MAP STOP") == 0) ||
+      (strcmp(line, "STOP MAP") == 0) ||
+      (strcmp(line, "MAP OFF") == 0))
+  {
+    return BLUETOOTH_CMD_STOP_MAPPING;
+  }
+
+  if ((strcmp(line, "EMERGENCY") == 0) ||
+      (strcmp(line, "EMERGENCY STOP") == 0) ||
+      (strcmp(line, "ESTOP") == 0) ||
+      (strcmp(line, "E STOP") == 0) ||
+      (strcmp(line, "ALL STOP") == 0) ||
+      (strcmp(line, "STOP ALL") == 0))
   {
     return BLUETOOTH_CMD_STOP_ALL;
+  }
+
+  if ((strcmp(line, "STOP") == 0) ||
+      (strcmp(line, "HALT") == 0))
+  {
+    return BLUETOOTH_CMD_DRIVE_STOP;
   }
 
   if ((strcmp(line, "SHOW") == 0) ||
@@ -638,8 +663,10 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
     return BLUETOOTH_CMD_AUTO_MAPPING_ON;
   }
 
-  if ((strcmp(line, "97") == 0) ||
-      (strcmp(line, "AUTO MAP OFF") == 0) ||
+  if ((strcmp(line, "AUTO MAP OFF") == 0) ||
+      (strcmp(line, "AUTO WALL OFF") == 0) ||
+      (strcmp(line, "WALL OFF") == 0) ||
+      (strcmp(line, "96 OFF") == 0) ||
       (strcmp(line, "MAPPING AUTO OFF") == 0))
   {
     return BLUETOOTH_CMD_AUTO_MAPPING_OFF;
@@ -684,6 +711,36 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
       (strcmp(line, "MPU CALIBRATE") == 0))
   {
     return BLUETOOTH_CMD_GYRO_CALIBRATE;
+  }
+
+  if ((strcmp(line, "MPU") == 0) ||
+      (strcmp(line, "MPU STATE") == 0) ||
+      (strcmp(line, "IMU") == 0) ||
+      (strcmp(line, "IMU STATE") == 0) ||
+      (strcmp(line, "GYRO STATE") == 0))
+  {
+    return BLUETOOTH_CMD_MPU_STATE;
+  }
+
+  if ((strcmp(line, "FRONT") == 0) ||
+      (strcmp(line, "FRONT STATE") == 0) ||
+      (strcmp(line, "FRONT STATUS") == 0) ||
+      (strcmp(line, "LIDAR FRONT") == 0) ||
+      (strcmp(line, "LIDAR FRONT STATE") == 0) ||
+      (strcmp(line, "LIDAR FRONT STATUS") == 0) ||
+      (strcmp(line, "LIDAR FRONT AREA") == 0) ||
+      (strcmp(line, "LIDAR FRONT AREA STA") == 0) ||
+      (strcmp(line, "LIDAR FRONT AREA STATUS") == 0))
+  {
+    return BLUETOOTH_CMD_LIDAR_FRONT_STATE;
+  }
+
+  if ((strcmp(line, "DIR") == 0) ||
+      (strcmp(line, "DIRECTION") == 0) ||
+      (strcmp(line, "HEADING") == 0) ||
+      (strcmp(line, "HEADING STATE") == 0))
+  {
+    return BLUETOOTH_CMD_DIR_STATE;
   }
 
   if (BluetoothControl_IsTurnDegreeCommand(line, 'L') ||
@@ -782,8 +839,8 @@ static void BluetoothControl_ApplyCommand(BluetoothCommandType_t command)
   {
     s_state.mapping_active = true;
   }
-  else if ((command == BLUETOOTH_CMD_STOP_ALL) ||
-           (command == BLUETOOTH_CMD_DRIVE_STOP) ||
+  else if ((command == BLUETOOTH_CMD_STOP_MAPPING) ||
+           (command == BLUETOOTH_CMD_STOP_ALL) ||
            (command == BLUETOOTH_CMD_SLAM_NAV_OFF))
   {
     s_state.mapping_active = false;

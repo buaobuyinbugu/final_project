@@ -289,10 +289,10 @@ class MapViewer:
         ttk.Button(root, text="96 Wall", command=lambda: self.send_command_text("96")).grid(
             row=2, column=3, padx=4, pady=(0, 10), sticky="ew"
         )
-        ttk.Button(root, text="97 Stop Auto", command=lambda: self.send_command_text("97")).grid(
+        ttk.Button(root, text="97 Stop Map", command=lambda: self.send_command_text("97")).grid(
             row=2, column=4, padx=4, pady=(0, 10), sticky="ew"
         )
-        ttk.Button(root, text="0", command=lambda: self.send_command_text("0")).grid(
+        ttk.Button(root, text="0 Brake", command=lambda: self.send_command_text("0")).grid(
             row=2, column=5, padx=(4, 10), pady=(0, 10), sticky="ew"
         )
 

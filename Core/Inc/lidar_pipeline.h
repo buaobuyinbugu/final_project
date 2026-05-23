@@ -57,5 +57,7 @@ bool LidarPipeline_Init(void);
 bool LidarPipeline_GetLatestResult(LidarParseResult_t *out_result);
 bool LidarPipeline_TakePoint(LidarPoint_t *out_point);
 uint32_t LidarPipeline_GetPointQueueDrops(void);
+int32_t LidarPipeline_LidarToRobotAngleCdeg(uint16_t lidar_angle_cdeg);
+uint16_t LidarPipeline_LidarToRobotAngleU16(uint16_t lidar_angle_cdeg);
 
 #endif /* LIDAR_PIPELINE_H */

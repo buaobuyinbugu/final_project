@@ -18,9 +18,9 @@
 #define SLAM_NAV_TASK_PERIOD_MS         20U
 #define SLAM_NAV_DEFAULT_DRIVE_PWM      450U
 #define SLAM_NAV_DEFAULT_TURN_PWM       450U
-#define SLAM_NAV_DEFAULT_SAFE_MM        250U
+#define SLAM_NAV_DEFAULT_SAFE_MM        350U
 #define SLAM_NAV_MAX_PWM                1000U
-#define SLAM_NAV_MIN_SAFE_MM            250U
+#define SLAM_NAV_MIN_SAFE_MM            350U
 #define SLAM_NAV_MIN_DRIVE_PWM          380U
 #define SLAM_NAV_MIN_TURN_PWM           380U
 #define SLAM_NAV_FRONT_SECTOR_CDEG      3000U
@@ -214,7 +214,7 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
       !s_active ||
       (point->quality == 0U) ||
       (point->distance_mm == 0U) ||
-      !SlamNav_IsFrontAngle(point->angle_cdeg))
+      !SlamNav_IsFrontAngle(LidarPipeline_LidarToRobotAngleU16(point->angle_cdeg)))
   {
     return;
   }

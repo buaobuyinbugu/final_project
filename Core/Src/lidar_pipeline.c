@@ -25,6 +25,11 @@ extern UART_HandleTypeDef huart1;
 #define LIDAR_SERVICE_TASK_STACK_WORDS 384U
 #define LIDAR_PARSER_TASK_PRIORITY    (tskIDLE_PRIORITY + 3U)
 #define LIDAR_SERVICE_TASK_PRIORITY   (tskIDLE_PRIORITY + 2U)
+#define LIDAR_PROTOCOL_Q6_TO_CDEG_NUMERATOR   100UL
+#define LIDAR_PROTOCOL_Q6_TO_CDEG_DENOMINATOR 64UL
+#define LIDAR_BODY_ANGLE_SIGN                 (-1L)
+#define LIDAR_BODY_YAW_OFFSET_CDEG            18000L
+#define LIDAR_MIN_POINT_QUALITY       30U
 
 typedef struct
 {
@@ -88,6 +93,8 @@ static bool LidarNode_TryDecode(const uint8_t raw_node[LIDAR_NODE_SIZE], LidarNo
 static void LidarPoint_Publish(const LidarNode_t *node);
 static bool LidarCommand_SendRequest(uint8_t command);
 static bool LidarCommand_StartScan(void);
+static uint16_t LidarProtocol_AngleQ6ToCdeg(uint16_t angle_q6);
+static int32_t LidarPipeline_NormalizeAngleCdeg(int32_t angle_cdeg);
 
 bool LidarPipeline_Init(void)
 {
@@ -185,6 +192,25 @@ uint32_t LidarPipeline_GetPointQueueDrops(void)
   taskEXIT_CRITICAL();
 
   return drops;
+}
+
+int32_t LidarPipeline_LidarToRobotAngleCdeg(uint16_t lidar_angle_cdeg)
+{
+  /*
+   * RPLIDAR C1 protocol geometry:
+   *   angle_q6 / 64 is the angle from the LiDAR forward X axis, increasing
+   *   clockwise toward the LiDAR +Y axis. This vehicle's LiDAR is mounted
+   *   reversed relative to the car front and mirrored in body coordinates, so
+   *   the shared conversion is:
+   *     body_angle = normalize(180deg - lidar_angle)
+   */
+  return LidarPipeline_NormalizeAngleCdeg(
+      LIDAR_BODY_YAW_OFFSET_CDEG + (LIDAR_BODY_ANGLE_SIGN * (int32_t)lidar_angle_cdeg));
+}
+
+uint16_t LidarPipeline_LidarToRobotAngleU16(uint16_t lidar_angle_cdeg)
+{
+  return (uint16_t)LidarPipeline_LidarToRobotAngleCdeg(lidar_angle_cdeg);
 }
 
 void HAL_UART_RxHalfCpltCallback(UART_HandleTypeDef *huart)
@@ -470,10 +496,19 @@ static bool LidarNode_TryDecode(const uint8_t raw_node[LIDAR_NODE_SIZE], LidarNo
 
   node->is_scan_start = start_bit;
   node->quality = raw_node[0] >> 2U;
-  node->angle_cdeg = (uint16_t)((angle_q6 * 100U) / 64U);
+  node->angle_cdeg = LidarProtocol_AngleQ6ToCdeg(angle_q6);
   node->distance_mm = (uint16_t)(distance_q2 / 4U);
 
   return true;
+}
+
+static uint16_t LidarProtocol_AngleQ6ToCdeg(uint16_t angle_q6)
+{
+  uint32_t angle_cdeg = (((uint32_t)angle_q6 * LIDAR_PROTOCOL_Q6_TO_CDEG_NUMERATOR) +
+                         (LIDAR_PROTOCOL_Q6_TO_CDEG_DENOMINATOR / 2UL)) /
+                        LIDAR_PROTOCOL_Q6_TO_CDEG_DENOMINATOR;
+
+  return (uint16_t)(angle_cdeg % 36000UL);
 }
 
 static void LidarPoint_Publish(const LidarNode_t *node)
@@ -482,6 +517,11 @@ static void LidarPoint_Publish(const LidarNode_t *node)
   LidarPoint_t dropped_point;
 
   if ((node == NULL) || (s_point_queue == NULL))
+  {
+    return;
+  }
+
+  if (node->quality < LIDAR_MIN_POINT_QUALITY)
   {
     return;
   }
@@ -527,4 +567,19 @@ static bool LidarCommand_StartScan(void)
   }
 
   return true;
+}
+
+static int32_t LidarPipeline_NormalizeAngleCdeg(int32_t angle_cdeg)
+{
+  while (angle_cdeg < 0L)
+  {
+    angle_cdeg += 36000L;
+  }
+
+  while (angle_cdeg >= 36000L)
+  {
+    angle_cdeg -= 36000L;
+  }
+
+  return angle_cdeg;
 }

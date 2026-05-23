@@ -1,6 +1,7 @@
 #include "mapping_grid.h"
 
 #include "FreeRTOS.h"
+#include "lidar_pipeline.h"
 #include "task.h"
 
 #include <math.h>
@@ -20,8 +21,6 @@
 #define MAPPING_GRID_MIN_DISTANCE_MM   80U
 #define MAPPING_GRID_MIN_QUALITY       0U
 #define MAPPING_GRID_PI                3.14159265358979323846f
-#define MAPPING_LIDAR_ANGLE_SIGN       (-1L)
-#define MAPPING_LIDAR_YAW_OFFSET_CDEG  0L
 
 static int8_t s_grid[MAPPING_GRID_HEIGHT_CELLS][MAPPING_GRID_WIDTH_CELLS];
 static MappingGridPose_t s_pose;
@@ -29,7 +28,6 @@ static bool s_pose_valid;
 static MappingGridStats_t s_stats;
 
 static int32_t MappingGrid_NormalizeAngleCdeg(int32_t angle_cdeg);
-static int32_t MappingGrid_LidarToRobotAngleCdeg(uint16_t lidar_angle_cdeg);
 static float MappingGrid_CdegToRadians(int32_t angle_cdeg);
 static bool MappingGrid_InsertPolarPointWithPose(const MappingGridPose_t *pose,
                                                  uint16_t angle_cdeg,
@@ -148,7 +146,7 @@ static bool MappingGrid_InsertPolarPointWithPose(const MappingGridPose_t *pose,
   }
 
   world_angle_cdeg = MappingGrid_NormalizeAngleCdeg(
-      pose->heading_cdeg + MappingGrid_LidarToRobotAngleCdeg(angle_cdeg));
+      pose->heading_cdeg + LidarPipeline_LidarToRobotAngleCdeg(angle_cdeg));
   angle_rad = MappingGrid_CdegToRadians(world_angle_cdeg);
   hit_world_x_mm = pose->x_mm + (int32_t)((float)distance_mm * cosf(angle_rad));
   hit_world_y_mm = pose->y_mm + (int32_t)((float)distance_mm * sinf(angle_rad));
@@ -356,12 +354,6 @@ static int32_t MappingGrid_NormalizeAngleCdeg(int32_t angle_cdeg)
   }
 
   return angle_cdeg;
-}
-
-static int32_t MappingGrid_LidarToRobotAngleCdeg(uint16_t lidar_angle_cdeg)
-{
-  return MappingGrid_NormalizeAngleCdeg(
-      MAPPING_LIDAR_YAW_OFFSET_CDEG + (MAPPING_LIDAR_ANGLE_SIGN * (int32_t)lidar_angle_cdeg));
 }
 
 static float MappingGrid_CdegToRadians(int32_t angle_cdeg)

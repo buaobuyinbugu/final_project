@@ -24,8 +24,10 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 try:
     import serial
+    from serial.tools import list_ports
 except ImportError:  # pragma: no cover - live serial is optional for replay mode.
     serial = None
+    list_ports = None
 
 
 DEFAULT_BAUD = 115200
@@ -34,6 +36,7 @@ GRID_H = 80
 CELL_MM = 50
 CANVAS_SIZE = 720
 LOG_LIMIT = 300
+BLUETOOTH_KEYWORDS = ("bluetooth", "standard serial over bluetooth", "bth", "spp")
 
 MAP_HEADER_RE = re.compile(r"MAP\s+(?P<state>\S+).*w=(?P<w>\d+)\s+h=(?P<h>\d+)\s+cell=(?P<cell>\d+)mm\s+rev=(?P<rev>\d+)")
 MAP_ROW_RE = re.compile(r"MAP ROW y=(?P<y>\d+)\s+rev=(?P<rev>\d+)\s+data=(?P<data>[.#?]+)")
@@ -46,6 +49,31 @@ SLAM_HB_RE = re.compile(
     r"path_i=(?P<path_i>\d+)\s+path_len=(?P<path_len>\d+)\s+front=(?P<front>\d+)\s+rev=(?P<rev>\d+)"
 )
 SLAM_STATE_RE = re.compile(r"SLAM state=(?P<state>\S+)\s+reason=(?P<reason>\S+)\s+seq=(?P<seq>\d+).*")
+
+
+def list_serial_port_labels() -> List[str]:
+    if list_ports is None:
+        return []
+
+    labels: List[str] = []
+    for port in list_ports.comports():
+        details = " ".join(
+            item for item in (port.description, port.manufacturer, port.hwid) if item
+        )
+        labels.append(f"{port.device}  {details}".strip())
+    return labels
+
+
+def extract_port_name(label: str) -> str:
+    return label.strip().split()[0] if label.strip() else ""
+
+
+def pick_bluetooth_port_label(labels: List[str]) -> Optional[str]:
+    for label in labels:
+        lower = label.lower()
+        if any(keyword in lower for keyword in BLUETOOTH_KEYWORDS):
+            return label
+    return labels[0] if len(labels) == 1 else None
 
 
 @dataclass
@@ -208,7 +236,19 @@ class SerialWorker:
 
         self.disconnect()
         self.stop_event.clear()
-        self.serial_obj = serial.Serial(port=port, baudrate=baud, timeout=0.2)
+        self.serial_obj = serial.Serial(
+            port=port,
+            baudrate=baud,
+            timeout=0.05,
+            write_timeout=1.0,
+            rtscts=False,
+            dsrdtr=False,
+        )
+        try:
+            self.serial_obj.setDTR(False)
+            self.serial_obj.setRTS(False)
+        except Exception:
+            pass
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
 
@@ -267,6 +307,7 @@ class SlamVisualizer(tk.Tk):
         self.worker = SerialWorker(self.events)
         self.baud_var = tk.IntVar(value=baud)
         self.port_var = tk.StringVar(value=port or "COM7")
+        self.port_labels: List[str] = []
         self.status_vars = {
             "source": tk.StringVar(value="offline"),
             "map": tk.StringVar(value="MAP IDLE rev=0"),
@@ -277,6 +318,7 @@ class SlamVisualizer(tk.Tk):
         }
 
         self._build_ui()
+        self._refresh_ports(auto_select=(port is None))
         if replay_path:
             self._start_replay(replay_path)
         elif port:
@@ -290,13 +332,18 @@ class SlamVisualizer(tk.Tk):
         toolbar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
 
         ttk.Label(toolbar, text="Port").pack(side=tk.LEFT)
-        ttk.Entry(toolbar, textvariable=self.port_var, width=10).pack(side=tk.LEFT, padx=(4, 8))
+        self.port_combo = ttk.Combobox(toolbar, textvariable=self.port_var, width=36)
+        self.port_combo.pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Button(toolbar, text="Refresh", command=lambda: self._refresh_ports(auto_select=False)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Auto BT", command=self._auto_select_bluetooth).pack(side=tk.LEFT, padx=2)
         ttk.Label(toolbar, text="Baud").pack(side=tk.LEFT)
         ttk.Entry(toolbar, textvariable=self.baud_var, width=8).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Button(toolbar, text="Connect", command=self._connect).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Disconnect", command=self._disconnect).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Replay Log", command=self._choose_replay).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="SLAM", command=lambda: self.worker.write_line("SLAM")).pack(side=tk.LEFT, padx=(16, 2))
+        ttk.Button(toolbar, text="Back", command=lambda: self.worker.write_line("BACK")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Gyro Cal", command=lambda: self.worker.write_line("GYRO CAL")).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Stop", command=lambda: self.worker.write_line("SLAM OFF")).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Show Map", command=lambda: self.worker.write_line("SHOW MAP")).pack(side=tk.LEFT, padx=2)
 
@@ -317,14 +364,35 @@ class SlamVisualizer(tk.Tk):
         self.log_box = tk.Text(side, height=24, width=44, state=tk.DISABLED)
         self.log_box.pack(fill=tk.BOTH, expand=True)
 
+    def _refresh_ports(self, auto_select: bool) -> None:
+        self.port_labels = list_serial_port_labels()
+        self.port_combo.configure(values=self.port_labels)
+        if auto_select:
+            selected = pick_bluetooth_port_label(self.port_labels)
+            if selected is not None:
+                self.port_var.set(selected)
+
+    def _auto_select_bluetooth(self) -> None:
+        self._refresh_ports(auto_select=False)
+        selected = pick_bluetooth_port_label(self.port_labels)
+        if selected is None:
+            messagebox.showwarning("Bluetooth port", "No Bluetooth-looking COM port found. Pair the module in Windows first.")
+            return
+        self.port_var.set(selected)
+
     def _connect(self) -> None:
+        port = extract_port_name(self.port_var.get())
+        if not port:
+            messagebox.showerror("Serial connect failed", "No COM port selected.")
+            return
+
         try:
-            self.worker.connect(self.port_var.get(), self.baud_var.get())
+            self.worker.connect(port, self.baud_var.get())
         except Exception as exc:
             messagebox.showerror("Serial connect failed", str(exc))
             return
         self.model.connected = True
-        self.model.source = self.port_var.get()
+        self.model.source = port
 
     def _disconnect(self) -> None:
         self.worker.disconnect()

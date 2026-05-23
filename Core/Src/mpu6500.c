@@ -14,9 +14,13 @@ extern I2C_HandleTypeDef hi2c1;
 #define MPU6500_REG_GYRO_ZOUT_H 0x47U
 #define MPU6500_REG_WHO_AM_I    0x75U
 #define MPU6500_WHO_AM_I_VALUE  0x70U
+#define MPU6500_CONFIG_DLPF_20HZ 0x04U
+#define MPU6500_GYRO_LPF_DIVISOR 4L
 
 static bool s_mpu_initialized;
 static Mpu6500State_t s_mpu_state;
+static bool s_gyro_filter_initialized;
+static int32_t s_gyro_z_filtered_dps_x100;
 
 static bool Mpu6500_ReadRegister(uint8_t reg, uint8_t *value);
 static bool Mpu6500_WriteRegister(uint8_t reg, uint8_t value);
@@ -61,7 +65,7 @@ bool Mpu6500_Init(void)
 
   if (!Mpu6500_WriteRegister(MPU6500_REG_PWR_MGMT_1, 0x01U) ||
       !Mpu6500_WriteRegister(MPU6500_REG_PWR_MGMT_2, 0x00U) ||
-      !Mpu6500_WriteRegister(MPU6500_REG_CONFIG, 0x03U) ||
+      !Mpu6500_WriteRegister(MPU6500_REG_CONFIG, MPU6500_CONFIG_DLPF_20HZ) ||
       !Mpu6500_WriteRegister(MPU6500_REG_GYRO_CONFIG, 0x00U))
   {
     s_mpu_state.ready = false;
@@ -71,6 +75,8 @@ bool Mpu6500_Init(void)
   s_mpu_state.ready = true;
   s_mpu_state.gyro_z_raw = 0;
   s_mpu_state.gyro_z_dps_x100 = 0;
+  s_gyro_filter_initialized = false;
+  s_gyro_z_filtered_dps_x100 = 0L;
   return true;
 }
 
@@ -95,10 +101,20 @@ void Mpu6500_Update(void)
 
   gyro_z_raw = (int16_t)(((uint16_t)raw[0] << 8) | raw[1]);
   gyro_z_dps_x100 = ((int32_t)gyro_z_raw * 100) / 131;
+  if (!s_gyro_filter_initialized)
+  {
+    s_gyro_z_filtered_dps_x100 = gyro_z_dps_x100;
+    s_gyro_filter_initialized = true;
+  }
+  else
+  {
+    s_gyro_z_filtered_dps_x100 +=
+        (gyro_z_dps_x100 - s_gyro_z_filtered_dps_x100) / MPU6500_GYRO_LPF_DIVISOR;
+  }
 
   taskENTER_CRITICAL();
   s_mpu_state.gyro_z_raw = gyro_z_raw;
-  s_mpu_state.gyro_z_dps_x100 = gyro_z_dps_x100;
+  s_mpu_state.gyro_z_dps_x100 = s_gyro_z_filtered_dps_x100;
   taskEXIT_CRITICAL();
 }
 

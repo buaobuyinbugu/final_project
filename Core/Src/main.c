@@ -62,15 +62,15 @@
 #define LIDAR_DEBUG_MAX_TX_PER_BATCH 4U
 #define ODOM_DEBUG_TX_INTERVAL_MS   500U
 #define AUTO_MAPPING_CONTROL_INTERVAL_MS 50U
-#define AUTO_MAPPING_FRONT_SECTOR_CDEG 3000U
+#define AUTO_MAPPING_FRONT_SECTOR_CDEG 1800U
 #define AUTO_MAPPING_SIDE_SECTOR_CDEG  3000U
 #define AUTO_MAPPING_RIGHT_CENTER_CDEG 9000U
 #define AUTO_MAPPING_LEFT_CENTER_CDEG  27000U
 #define AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG 4500U
 #define AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG 31500U
 #define AUTO_MAPPING_DIAGONAL_SECTOR_CDEG 1800U
-#define AUTO_MAPPING_MIN_SAFE_MM    250U
-#define AUTO_MAPPING_MAX_SAFE_MM    800U
+#define AUTO_MAPPING_MIN_SAFE_MM    350U
+#define AUTO_MAPPING_MAX_SAFE_MM    3000U
 #define AUTO_MAPPING_MAX_DRIVE_PWM  1000U
 #define AUTO_MAPPING_MAX_TURN_PWM   1000U
 #define AUTO_MAPPING_OPEN_MARGIN_MM 180U
@@ -81,7 +81,7 @@
 #define AUTO_MAPPING_RIGHT_BRANCH_CONFIRM_COUNT 5U
 #define AUTO_MAPPING_OBSERVE_SCAN_STARTS 3U
 #define AUTO_MAPPING_OBSERVE_TIMEOUT_MS 700U
-#define AUTO_MAPPING_FRONT_BLOCK_HOLD_MS 550U
+#define AUTO_MAPPING_FRONT_BLOCK_HOLD_MS 400U
 #define AUTO_MAPPING_MIN_TURN_DEG   40U
 #define AUTO_MAPPING_MAX_TURN_DEG   180U
 #define AUTO_MAPPING_TURN_SETTLE_MS 240U
@@ -105,8 +105,9 @@
 #define ENCODER_RIGHT_DELTA_SIGN    (-1L)
 #define MAPPING_ENCODER_MM_PER_COUNT_X1000 133L
 #define GYRO_STATIONARY_COUNT_THRESHOLD 2L
+#define GYRO_BIAS_STATIONARY_CONFIRM_SAMPLES 25U
 #define GYRO_BIAS_FILTER_DIVISOR    16L
-#define GYRO_DEADBAND_DPS_X100      15L
+#define GYRO_DEADBAND_DPS_X100      25L
 #define GYRO_CALIBRATION_DURATION_MS 2000U
 #define GYRO_CALIBRATION_MIN_SAMPLES 50U
 #define GYRO_CALIBRATION_MAX_MOVING_SAMPLES 8U
@@ -159,6 +160,18 @@ typedef struct
   int32_t right_total;
 } encoder_test_state_t;
 
+typedef struct
+{
+  uint32_t scan_seq;
+  uint32_t last_tick_ms;
+  uint32_t min_tick_ms;
+  uint16_t point_count;
+  uint16_t min_distance_mm;
+  uint16_t min_raw_angle_cdeg;
+  uint16_t min_robot_angle_cdeg;
+  uint8_t min_quality;
+} lidar_front_stats_t;
+
 static uint16_t adc_buf[ADC_CHANNEL_COUNT];
 static uint8_t oled_fb[OLED_FB_SIZE];
 static uint8_t oled_page_tx[OLED_WIDTH + 1U];
@@ -191,6 +204,9 @@ static encoder_test_state_t encoder_test = {0};
 static MappingGridPose_t mapping_pose = {0};
 static uint8_t next_map_tx_row = 0U;
 static uint32_t lidar_debug_seq = 0U;
+static uint32_t lidar_front_scan_seq = 0U;
+static lidar_front_stats_t lidar_front_current = {0};
+static lidar_front_stats_t lidar_front_last = {0};
 static int32_t mapping_travel_residual_x1000 = 0L;
 static uint32_t last_odom_debug_update_tick_ms = 0U;
 static uint32_t last_odom_debug_tx_tick_ms = 0U;
@@ -200,6 +216,7 @@ static int32_t odom_debug_right_counts = 0L;
 static int32_t odom_debug_heading_cdeg = 0L;
 static int32_t gyro_z_bias_dps_x100 = 0L;
 static int32_t gyro_z_corrected_dps_x100 = 0L;
+static uint8_t gyro_bias_stationary_samples = 0U;
 static MappingGridPose_t mapping_pose_history[MAPPING_POSE_HISTORY_LENGTH];
 static uint32_t mapping_pose_history_ticks[MAPPING_POSE_HISTORY_LENGTH];
 static uint8_t mapping_pose_history_next = 0U;
@@ -222,6 +239,9 @@ static uint32_t auto_mapping_resume_tick_ms = 0U;
 static uint32_t auto_mapping_ignore_right_until_ms = 0U;
 static uint32_t auto_mapping_observe_deadline_ms = 0U;
 static uint32_t auto_mapping_front_blocked_until_ms = 0U;
+static uint32_t auto_mapping_front_last_seen_ms = 0U;
+static uint16_t auto_mapping_front_last_robot_angle_cdeg = 0U;
+static uint16_t auto_mapping_front_last_raw_angle_cdeg = 0U;
 static uint8_t auto_mapping_right_branch_confirm_count = 0U;
 static uint8_t auto_mapping_observe_scan_starts_remaining = 0U;
 static bool auto_mapping_right_wall_seen = false;
@@ -234,6 +254,7 @@ static uint16_t gyro_calibration_moving_samples = 0U;
 static bool angle_turn_active = false;
 static int8_t angle_turn_direction = 0;
 static bool angle_turn_heading_target_valid = false;
+static bool angle_turn_completed_by_progress = false;
 static uint8_t angle_turn_correction_count = 0U;
 static int32_t angle_turn_target_cdeg = 0L;
 static int32_t angle_turn_target_heading_cdeg = 0L;
@@ -269,6 +290,9 @@ static void TestApp_ResumeMapping(void);
 static void TestApp_StopMapping(void);
 static void TestApp_ProcessLidarPoints(void);
 static void TestApp_SendLidarDebugPoint(const LidarPoint_t *point);
+static void TestApp_UpdateLidarFrontStats(const LidarPoint_t *point);
+static void TestApp_ResetLidarFrontStats(lidar_front_stats_t *stats, uint32_t scan_seq);
+static void TestApp_SendLidarFrontState(void);
 static void TestApp_UpdateMappingPose(uint32_t now_ms, int16_t left_delta, int16_t right_delta);
 static void TestApp_ResetPoseHistory(void);
 static void TestApp_RecordPoseHistory(uint32_t tick_ms);
@@ -307,6 +331,8 @@ static void TestApp_StreamPose(void);
 static void TestApp_RequestFullMapStream(void);
 static void TestApp_SendMapHeader(const char *state);
 static void TestApp_SendMapStat(void);
+static void TestApp_SendMpuState(void);
+static void TestApp_SendDirState(void);
 static int32_t AppAbs32(int32_t value);
 static uint16_t ClampPwmPermille(uint16_t value, uint16_t max_value);
 static uint16_t GetObstacleSafeDistanceMm(void);
@@ -679,10 +705,12 @@ static int32_t AppAbs32(int32_t value)
 
 static void TestApp_UpdateGyroDriftCompensation(int16_t left_delta, int16_t right_delta)
 {
+  MotorControlState_t motor_state = {0};
   int32_t raw_gyro;
   int32_t diff;
   int32_t bias_step;
   bool stationary;
+  bool motor_idle = true;
 
   if (gyro_calibration_active)
   {
@@ -697,9 +725,26 @@ static void TestApp_UpdateGyroDriftCompensation(int16_t left_delta, int16_t righ
   }
 
   raw_gyro = mpu_state.gyro_z_dps_x100;
+  if (MotorControl_GetState(&motor_state))
+  {
+    motor_idle = (motor_state.active_pwm_mask == 0U);
+  }
+
   stationary = ((AppAbs32((int32_t)left_delta) + AppAbs32((int32_t)right_delta)) <= GYRO_STATIONARY_COUNT_THRESHOLD);
 
-  if (stationary)
+  if (stationary && motor_idle)
+  {
+    if (gyro_bias_stationary_samples < GYRO_BIAS_STATIONARY_CONFIRM_SAMPLES)
+    {
+      gyro_bias_stationary_samples++;
+    }
+  }
+  else
+  {
+    gyro_bias_stationary_samples = 0U;
+  }
+
+  if (gyro_bias_stationary_samples >= GYRO_BIAS_STATIONARY_CONFIRM_SAMPLES)
   {
     diff = raw_gyro - gyro_z_bias_dps_x100;
     bias_step = diff / GYRO_BIAS_FILTER_DIVISOR;
@@ -725,6 +770,7 @@ static void TestApp_StartGyroCalibration(void)
   gyro_calibration_samples = 0U;
   gyro_calibration_moving_samples = 0U;
   gyro_z_corrected_dps_x100 = 0L;
+  gyro_bias_stationary_samples = 0U;
 
   (void)BluetoothControl_SendText("GYRO CAL START hold_still_ms=2000\r\n");
 }
@@ -771,6 +817,7 @@ static void TestApp_UpdateGyroCalibration(uint32_t now_ms, int16_t left_delta, i
   if ((gyro_calibration_samples < GYRO_CALIBRATION_MIN_SAMPLES) ||
       (gyro_calibration_moving_samples > GYRO_CALIBRATION_MAX_MOVING_SAMPLES))
   {
+    gyro_bias_stationary_samples = 0U;
     (void)snprintf(
         line,
         sizeof(line),
@@ -783,6 +830,7 @@ static void TestApp_UpdateGyroCalibration(uint32_t now_ms, int16_t left_delta, i
 
   gyro_z_bias_dps_x100 = (int32_t)(gyro_calibration_sum_dps_x100 / (int64_t)gyro_calibration_samples);
   gyro_z_corrected_dps_x100 = 0L;
+  gyro_bias_stationary_samples = GYRO_BIAS_STATIONARY_CONFIRM_SAMPLES;
   mapping_pose.heading_cdeg = MAPPING_START_HEADING_CDEG;
   odom_debug_heading_cdeg = 0L;
   MappingGrid_SetPose(&mapping_pose);
@@ -1025,6 +1073,13 @@ static void TestApp_HandleBluetoothCommands(void)
         break;
 
       case BLUETOOTH_CMD_DRIVE_STOP:
+        SlamNav_Stop();
+        TestApp_StopAutoMapping();
+        TestApp_StopAngleTurn(false);
+        MotorControl_Stop();
+        (void)BluetoothControl_SendText("MOTOR brake\r\n");
+        break;
+
       case BLUETOOTH_CMD_STOP_ALL:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
@@ -1033,21 +1088,23 @@ static void TestApp_HandleBluetoothCommands(void)
         TestApp_StopMapping();
         lidar_debug_active = false;
         TestApp_StopOdomDebug();
-        (void)BluetoothControl_SendText("MOTOR stop\r\n");
+        (void)BluetoothControl_SendText("EMERGENCY STOP\r\n");
         break;
 
       case BLUETOOTH_CMD_START_MAPPING:
         SlamNav_Stop();
-        TestApp_StopAutoMapping();
-        TestApp_StopAngleTurn(false);
-        MotorControl_Stop();
         TestApp_StartMapping();
+        break;
+
+      case BLUETOOTH_CMD_STOP_MAPPING:
+        TestApp_StopMapping();
+        (void)BluetoothControl_SendText("MAP STOP\r\n");
         break;
 
       case BLUETOOTH_CMD_LIDAR_DEBUG_ON:
         lidar_debug_active = true;
         lidar_debug_seq = 0U;
-        (void)BluetoothControl_SendText("LIDAR START format=LP seq=<n> a=<cdeg> d=<mm> q=<quality> s=<scan_start>\r\n");
+        (void)BluetoothControl_SendText("LIDAR START format=LP seq=<n> a=<raw_cdeg> r=<robot_cdeg> d=<mm> q=<quality> s=<scan_start>\r\n");
         break;
 
       case BLUETOOTH_CMD_LIDAR_DEBUG_OFF:
@@ -1071,7 +1128,6 @@ static void TestApp_HandleBluetoothCommands(void)
       case BLUETOOTH_CMD_AUTO_MAPPING_OFF:
         SlamNav_Stop();
         TestApp_StopAutoMapping();
-        TestApp_StopMapping();
         (void)BluetoothControl_SendText("AUTO MAP STOP\r\n");
         break;
 
@@ -1106,6 +1162,18 @@ static void TestApp_HandleBluetoothCommands(void)
         MotorControl_Stop();
         TestApp_StopMapping();
         TestApp_StartGyroCalibration();
+        break;
+
+      case BLUETOOTH_CMD_MPU_STATE:
+        TestApp_SendMpuState();
+        break;
+
+      case BLUETOOTH_CMD_LIDAR_FRONT_STATE:
+        TestApp_SendLidarFrontState();
+        break;
+
+      case BLUETOOTH_CMD_DIR_STATE:
+        TestApp_SendDirState();
         break;
 
       case BLUETOOTH_CMD_TURN_LEFT_DEG:
@@ -1221,6 +1289,7 @@ static void TestApp_ProcessLidarPoints(void)
 
     if (point_is_fresh)
     {
+      TestApp_UpdateLidarFrontStats(&point);
       TestApp_UpdateAutoMappingObstacle(&point);
       SlamNav_ObserveLidarPoint(&point);
     }
@@ -1239,7 +1308,7 @@ static void TestApp_ProcessLidarPoints(void)
 
 static void TestApp_SendLidarDebugPoint(const LidarPoint_t *point)
 {
-  char line[80];
+  char line[96];
 
   if (point == NULL)
   {
@@ -1249,12 +1318,106 @@ static void TestApp_SendLidarDebugPoint(const LidarPoint_t *point)
   (void)snprintf(
       line,
       sizeof(line),
-      "LP seq=%lu a=%u d=%u q=%u s=%u\r\n",
+      "LP seq=%lu a=%u r=%u d=%u q=%u s=%u\r\n",
       (unsigned long)lidar_debug_seq++,
       (unsigned int)point->angle_cdeg,
+      (unsigned int)LidarPipeline_LidarToRobotAngleU16(point->angle_cdeg),
       (unsigned int)point->distance_mm,
       (unsigned int)point->quality,
       (unsigned int)((point->flags & LIDAR_POINT_FLAG_SCAN_START) != 0U));
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_UpdateLidarFrontStats(const LidarPoint_t *point)
+{
+  uint16_t robot_angle_cdeg;
+
+  if (point == NULL)
+  {
+    return;
+  }
+
+  if ((point->flags & LIDAR_POINT_FLAG_SCAN_START) != 0U)
+  {
+    if (lidar_front_current.point_count > 0U)
+    {
+      lidar_front_last = lidar_front_current;
+    }
+    lidar_front_scan_seq++;
+    TestApp_ResetLidarFrontStats(&lidar_front_current, lidar_front_scan_seq);
+  }
+
+  robot_angle_cdeg = LidarPipeline_LidarToRobotAngleU16(point->angle_cdeg);
+  if (!TestApp_IsFrontLidarPoint(robot_angle_cdeg))
+  {
+    return;
+  }
+
+  lidar_front_current.point_count++;
+  lidar_front_current.last_tick_ms = HAL_GetTick();
+  if ((lidar_front_current.min_distance_mm == 0U) ||
+      (point->distance_mm < lidar_front_current.min_distance_mm))
+  {
+    lidar_front_current.min_tick_ms = lidar_front_current.last_tick_ms;
+    lidar_front_current.min_distance_mm = point->distance_mm;
+    lidar_front_current.min_raw_angle_cdeg = point->angle_cdeg;
+    lidar_front_current.min_robot_angle_cdeg = robot_angle_cdeg;
+    lidar_front_current.min_quality = point->quality;
+  }
+}
+
+static void TestApp_ResetLidarFrontStats(lidar_front_stats_t *stats, uint32_t scan_seq)
+{
+  if (stats == NULL)
+  {
+    return;
+  }
+
+  memset(stats, 0, sizeof(*stats));
+  stats->scan_seq = scan_seq;
+}
+
+static void TestApp_SendLidarFrontState(void)
+{
+  lidar_front_stats_t stats = lidar_front_last;
+  uint32_t now = HAL_GetTick();
+  uint32_t age_ms = 0U;
+  uint16_t safe_mm = GetObstacleSafeDistanceMm();
+  bool data_valid;
+  bool direct_blocked;
+  bool auto_blocked;
+  char line[192];
+
+  if ((lidar_front_current.point_count > 0U) &&
+      ((stats.point_count == 0U) || (lidar_front_current.last_tick_ms >= stats.last_tick_ms)))
+  {
+    stats = lidar_front_current;
+  }
+
+  if (stats.min_tick_ms != 0U)
+  {
+    age_ms = now - stats.min_tick_ms;
+  }
+
+  data_valid = ((stats.point_count > 0U) && (stats.min_distance_mm > 0U));
+  direct_blocked = data_valid && (stats.min_distance_mm <= safe_mm);
+  auto_blocked = TestApp_IsAutoFrontBlocked(now);
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "LIDAR FRONT scan=%lu cnt=%u min=%u raw=%u robot=%u q=%u age=%lu safe=%u sector=%u blocked=%u auto=%u\r\n",
+      (unsigned long)stats.scan_seq,
+      (unsigned int)stats.point_count,
+      (unsigned int)stats.min_distance_mm,
+      (unsigned int)stats.min_raw_angle_cdeg,
+      (unsigned int)stats.min_robot_angle_cdeg,
+      (unsigned int)stats.min_quality,
+      (unsigned long)age_ms,
+      (unsigned int)safe_mm,
+      (unsigned int)AUTO_MAPPING_FRONT_SECTOR_CDEG,
+      (unsigned int)direct_blocked,
+      (unsigned int)auto_blocked);
   (void)BluetoothControl_SendText(line);
 }
 
@@ -1271,14 +1434,20 @@ static void TestApp_UpdateMappingPose(uint32_t now_ms, int16_t left_delta, int16
 
   if (!mapping_active)
   {
-    last_mapping_pose_tick_ms = now_ms;
-    return;
+    if (!auto_mapping_active && !angle_turn_active && !SlamNav_IsActive())
+    {
+      last_mapping_pose_tick_ms = now_ms;
+      return;
+    }
   }
 
   if (last_mapping_pose_tick_ms == 0U)
   {
     last_mapping_pose_tick_ms = now_ms;
-    MappingGrid_SetPose(&mapping_pose);
+    if (mapping_active)
+    {
+      MappingGrid_SetPose(&mapping_pose);
+    }
     return;
   }
 
@@ -1306,8 +1475,11 @@ static void TestApp_UpdateMappingPose(uint32_t now_ms, int16_t left_delta, int16
     }
   }
 
-  MappingGrid_SetPose(&mapping_pose);
-  TestApp_RecordPoseHistory(now_ms);
+  if (mapping_active)
+  {
+    MappingGrid_SetPose(&mapping_pose);
+    TestApp_RecordPoseHistory(now_ms);
+  }
 }
 
 static void TestApp_ResetPoseHistory(void)
@@ -1417,7 +1589,7 @@ static void TestApp_UpdateOdomDebug(uint32_t now_ms, int16_t left_delta, int16_t
 
 static void TestApp_StreamOdomDebug(void)
 {
-  char line[160];
+  char line[192];
   uint32_t now = HAL_GetTick();
   int32_t abs_left;
   int32_t abs_right;
@@ -1510,6 +1682,7 @@ static void TestApp_StartAngleTurn(int8_t direction, uint16_t degrees)
   angle_turn_active = true;
   angle_turn_direction = (direction < 0) ? -1 : 1;
   angle_turn_heading_target_valid = false;
+  angle_turn_completed_by_progress = false;
   angle_turn_correction_count = 0U;
   angle_turn_target_cdeg = (int32_t)degrees * 100L;
   angle_turn_target_heading_cdeg = 0L;
@@ -1579,6 +1752,7 @@ static void TestApp_StopAngleTurn(bool completed)
 {
   char line[80];
   bool heading_target_valid;
+  bool completed_by_progress;
   uint8_t correction_count;
   int32_t target_heading_cdeg;
   int32_t heading_error_cdeg = 0L;
@@ -1589,6 +1763,7 @@ static void TestApp_StopAngleTurn(bool completed)
   }
 
   heading_target_valid = angle_turn_heading_target_valid;
+  completed_by_progress = angle_turn_completed_by_progress;
   correction_count = angle_turn_correction_count;
   target_heading_cdeg = angle_turn_target_heading_cdeg;
   if (heading_target_valid)
@@ -1599,10 +1774,22 @@ static void TestApp_StopAngleTurn(bool completed)
   angle_turn_active = false;
   angle_turn_direction = 0;
   angle_turn_heading_target_valid = false;
+  angle_turn_completed_by_progress = false;
   MotorControl_Stop();
+
+  if (completed && heading_target_valid && completed_by_progress)
+  {
+    mapping_pose.heading_cdeg = NormalizeHeadingCdeg(target_heading_cdeg);
+    if (mapping_active)
+    {
+      MappingGrid_SetPose(&mapping_pose);
+    }
+    heading_error_cdeg = 0L;
+  }
 
   if (completed &&
       heading_target_valid &&
+      !completed_by_progress &&
       (AppAbs32(heading_error_cdeg) > ANGLE_TURN_CORRECTION_TOL_CDEG) &&
       (correction_count < ANGLE_TURN_MAX_CORRECTIONS))
   {
@@ -1636,6 +1823,8 @@ static void TestApp_UpdateAngleTurn(uint32_t now_ms)
   uint32_t delta_ms;
   int32_t delta_cdeg;
   int32_t remaining_cdeg;
+  int32_t progress_remaining_cdeg;
+  int32_t heading_remaining_cdeg;
   uint16_t turn_pwm;
 
   if (!angle_turn_active)
@@ -1654,20 +1843,29 @@ static void TestApp_UpdateAngleTurn(uint32_t now_ms)
   angle_turn_last_tick_ms = now_ms;
   delta_cdeg = (gyro_z_corrected_dps_x100 * (int32_t)delta_ms) / 1000L;
   angle_turn_progress_cdeg += AppAbs32(delta_cdeg);
+  progress_remaining_cdeg = angle_turn_target_cdeg - angle_turn_progress_cdeg;
 
   if (angle_turn_heading_target_valid)
   {
-    remaining_cdeg = AppAbs32(TestApp_SignedHeadingErrorCdeg(
+    heading_remaining_cdeg = AppAbs32(TestApp_SignedHeadingErrorCdeg(
         angle_turn_target_heading_cdeg,
         mapping_pose.heading_cdeg));
+    remaining_cdeg = (progress_remaining_cdeg < heading_remaining_cdeg) ?
+        progress_remaining_cdeg :
+        heading_remaining_cdeg;
   }
   else
   {
-    remaining_cdeg = angle_turn_target_cdeg - angle_turn_progress_cdeg;
+    heading_remaining_cdeg = 0L;
+    remaining_cdeg = progress_remaining_cdeg;
   }
 
   if (remaining_cdeg <= ANGLE_TURN_DONE_TOL_CDEG)
   {
+    angle_turn_completed_by_progress =
+        angle_turn_heading_target_valid &&
+        (progress_remaining_cdeg <= ANGLE_TURN_DONE_TOL_CDEG) &&
+        (heading_remaining_cdeg > ANGLE_TURN_DONE_TOL_CDEG);
     TestApp_StopAngleTurn(true);
     return;
   }
@@ -1700,7 +1898,6 @@ static void TestApp_UpdateAngleTurn(uint32_t now_ms)
 
 static void TestApp_StartAutoMapping(void)
 {
-  TestApp_StartMapping();
   auto_mapping_active = true;
   TestApp_ResetAutoMappingSectorMins();
   last_auto_mapping_control_tick_ms = 0U;
@@ -1709,6 +1906,9 @@ static void TestApp_StartAutoMapping(void)
   auto_mapping_ignore_right_until_ms = 0U;
   auto_mapping_observe_deadline_ms = 0U;
   auto_mapping_front_blocked_until_ms = 0U;
+  auto_mapping_front_last_seen_ms = 0U;
+  auto_mapping_front_last_robot_angle_cdeg = 0U;
+  auto_mapping_front_last_raw_angle_cdeg = 0U;
   auto_mapping_right_branch_confirm_count = 0U;
   auto_mapping_right_wall_seen = false;
   auto_mapping_observe_after_resume = false;
@@ -1730,6 +1930,9 @@ static void TestApp_StopAutoMapping(void)
   auto_mapping_ignore_right_until_ms = 0U;
   auto_mapping_observe_deadline_ms = 0U;
   auto_mapping_front_blocked_until_ms = 0U;
+  auto_mapping_front_last_seen_ms = 0U;
+  auto_mapping_front_last_robot_angle_cdeg = 0U;
+  auto_mapping_front_last_raw_angle_cdeg = 0U;
   auto_mapping_right_branch_confirm_count = 0U;
   auto_mapping_observe_scan_starts_remaining = 0U;
   auto_mapping_right_wall_seen = false;
@@ -1761,6 +1964,8 @@ static bool TestApp_IsLidarAngleNear(uint16_t angle_cdeg, uint16_t center_cdeg, 
 
 static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
 {
+  uint16_t robot_angle_cdeg;
+
   if ((point == NULL) || !auto_mapping_active)
   {
     return;
@@ -1772,20 +1977,29 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
     return;
   }
 
+  robot_angle_cdeg = LidarPipeline_LidarToRobotAngleU16(point->angle_cdeg);
+
   if (((point->flags & LIDAR_POINT_FLAG_SCAN_START) != 0U) &&
       (auto_mapping_observe_scan_starts_remaining > 0U))
   {
     auto_mapping_observe_scan_starts_remaining--;
   }
 
-  if (TestApp_IsFrontLidarPoint(point->angle_cdeg) &&
+  if (TestApp_IsFrontLidarPoint(robot_angle_cdeg))
+  {
+    auto_mapping_front_last_seen_ms = HAL_GetTick();
+    auto_mapping_front_last_robot_angle_cdeg = robot_angle_cdeg;
+    auto_mapping_front_last_raw_angle_cdeg = point->angle_cdeg;
+  }
+
+  if (TestApp_IsFrontLidarPoint(robot_angle_cdeg) &&
       (point->distance_mm < auto_mapping_front_min_mm))
   {
     auto_mapping_front_min_mm = point->distance_mm;
-    auto_mapping_front_blocking_angle_cdeg = point->angle_cdeg;
+    auto_mapping_front_blocking_angle_cdeg = robot_angle_cdeg;
   }
 
-  if (TestApp_IsFrontLidarPoint(point->angle_cdeg) &&
+  if (TestApp_IsFrontLidarPoint(robot_angle_cdeg) &&
       (point->distance_mm <= GetObstacleSafeDistanceMm()))
   {
     auto_mapping_front_blocked_until_ms = HAL_GetTick() + AUTO_MAPPING_FRONT_BLOCK_HOLD_MS;
@@ -1795,45 +2009,45 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
     }
   }
 
-  if (TestApp_IsLidarAngleNear(point->angle_cdeg, AUTO_MAPPING_RIGHT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) &&
+  if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_RIGHT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) &&
       (point->distance_mm < auto_mapping_right_min_mm))
   {
     auto_mapping_right_min_mm = point->distance_mm;
   }
 
-  if (TestApp_IsLidarAngleNear(point->angle_cdeg, AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG) &&
+  if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG) &&
       (point->distance_mm < auto_mapping_front_right_min_mm))
   {
     auto_mapping_front_right_min_mm = point->distance_mm;
   }
 
-  if ((TestApp_IsLidarAngleNear(point->angle_cdeg, AUTO_MAPPING_RIGHT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) ||
-       TestApp_IsLidarAngleNear(point->angle_cdeg, AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG)) &&
+  if ((TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_RIGHT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) ||
+       TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG)) &&
       (point->distance_mm > auto_mapping_right_best_distance_mm))
   {
     auto_mapping_right_best_distance_mm = point->distance_mm;
-    auto_mapping_right_best_angle_cdeg = point->angle_cdeg;
+    auto_mapping_right_best_angle_cdeg = robot_angle_cdeg;
   }
 
-  if (TestApp_IsLidarAngleNear(point->angle_cdeg, AUTO_MAPPING_LEFT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) &&
+  if (TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_LEFT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) &&
       (point->distance_mm < auto_mapping_left_min_mm))
   {
     auto_mapping_left_min_mm = point->distance_mm;
   }
 
-  if ((TestApp_IsLidarAngleNear(point->angle_cdeg, AUTO_MAPPING_LEFT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) ||
-       TestApp_IsLidarAngleNear(point->angle_cdeg, AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG)) &&
+  if ((TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_LEFT_CENTER_CDEG, AUTO_MAPPING_SIDE_SECTOR_CDEG) ||
+       TestApp_IsLidarAngleNear(robot_angle_cdeg, AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG, AUTO_MAPPING_DIAGONAL_SECTOR_CDEG)) &&
       (point->distance_mm > auto_mapping_left_best_distance_mm))
   {
     auto_mapping_left_best_distance_mm = point->distance_mm;
-    auto_mapping_left_best_angle_cdeg = point->angle_cdeg;
+    auto_mapping_left_best_angle_cdeg = robot_angle_cdeg;
   }
 
-  if (!TestApp_IsFrontLidarPoint(point->angle_cdeg) &&
+  if (!TestApp_IsFrontLidarPoint(robot_angle_cdeg) &&
       (point->distance_mm > auto_mapping_escape_best_distance_mm))
   {
     auto_mapping_escape_best_distance_mm = point->distance_mm;
-    auto_mapping_escape_best_angle_cdeg = point->angle_cdeg;
+    auto_mapping_escape_best_angle_cdeg = robot_angle_cdeg;
   }
 }
 
@@ -2043,7 +2257,7 @@ static uint16_t TestApp_GetTurnDegreesFromLidarAngle(uint16_t target_angle_cdeg,
   {
     if (out_direction != NULL)
     {
-      *out_direction = 1;
+      *out_direction = -1;
     }
     degrees = (uint16_t)(((uint32_t)normalized_angle_cdeg + 50U) / 100U);
   }
@@ -2051,7 +2265,7 @@ static uint16_t TestApp_GetTurnDegreesFromLidarAngle(uint16_t target_angle_cdeg,
   {
     if (out_direction != NULL)
     {
-      *out_direction = -1;
+      *out_direction = 1;
     }
     degrees = (uint16_t)((((uint32_t)(36000U - normalized_angle_cdeg)) + 50U) / 100U);
   }
@@ -2065,7 +2279,7 @@ static uint16_t TestApp_GetAutoRightTurnDegrees(void)
 
   if (auto_mapping_right_best_distance_mm == 0U)
   {
-    if ((auto_mapping_escape_best_distance_mm > 0U) && (auto_mapping_escape_best_angle_cdeg <= 18000U))
+    if ((auto_mapping_escape_best_distance_mm > 0U) && (auto_mapping_escape_best_angle_cdeg >= 18000U))
     {
       return TestApp_GetTurnDegreesFromLidarAngle(auto_mapping_escape_best_angle_cdeg, &direction);
     }
@@ -2170,7 +2384,7 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
   (void)snprintf(
       line,
       sizeof(line),
-      "AUTO WALL %s dir=%c req=%u snap=%u head=%ld target=%u front=%u right=%u left=%u count=%lu\r\n",
+      "AUTO WALL %s dir=%c req=%u snap=%u head=%ld target=%u front=%u fraw=%u fang=%u right=%u left=%u count=%lu\r\n",
       reason,
       (direction < 0) ? 'L' : 'R',
       (unsigned int)degrees,
@@ -2178,6 +2392,8 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
       (long)target_heading_cdeg,
       (unsigned int)auto_mapping_last_turn_target_angle_cdeg,
       (unsigned int)auto_mapping_front_min_mm,
+      (unsigned int)auto_mapping_front_last_raw_angle_cdeg,
+      (unsigned int)auto_mapping_front_last_robot_angle_cdeg,
       (unsigned int)auto_mapping_right_min_mm,
       (unsigned int)auto_mapping_left_min_mm,
       (unsigned long)auto_mapping_avoid_count);
@@ -2314,6 +2530,45 @@ static void TestApp_SendMapStat(void)
       (long)mapping_pose.x_mm,
       (long)mapping_pose.y_mm,
       (long)mapping_pose.heading_cdeg);
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_SendMpuState(void)
+{
+  char line[192];
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "MPU STATE ready=%u who=%02X raw=%d gz=%ld bias=%ld corr=%ld heading=%ld map=%u cal=%u\r\n",
+      (unsigned int)mpu_state.ready,
+      (unsigned int)mpu_state.who_am_i,
+      (int)mpu_state.gyro_z_raw,
+      (long)mpu_state.gyro_z_dps_x100,
+      (long)gyro_z_bias_dps_x100,
+      (long)gyro_z_corrected_dps_x100,
+      (long)mapping_pose.heading_cdeg,
+      (unsigned int)mapping_active,
+      (unsigned int)gyro_calibration_active);
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_SendDirState(void)
+{
+  char line[128];
+  int32_t heading_cdeg = NormalizeHeadingCdeg(mapping_pose.heading_cdeg);
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "DIR heading=%ld deg=%ld.%02ld map=%u mpu=%u bias=%ld corr=%ld\r\n",
+      (long)heading_cdeg,
+      (long)(heading_cdeg / 100L),
+      (long)(heading_cdeg % 100L),
+      (unsigned int)mapping_active,
+      (unsigned int)mpu_state.ready,
+      (long)gyro_z_bias_dps_x100,
+      (long)gyro_z_corrected_dps_x100);
   (void)BluetoothControl_SendText(line);
 }
 
