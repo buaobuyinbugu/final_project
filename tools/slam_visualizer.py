@@ -40,13 +40,16 @@ BLUETOOTH_KEYWORDS = ("bluetooth", "standard serial over bluetooth", "bth", "spp
 
 MAP_HEADER_RE = re.compile(r"MAP\s+(?P<state>\S+).*w=(?P<w>\d+)\s+h=(?P<h>\d+)\s+cell=(?P<cell>\d+)mm\s+rev=(?P<rev>\d+)")
 MAP_ROW_RE = re.compile(r"MAP ROW y=(?P<y>\d+)\s+rev=(?P<rev>\d+)\s+data=(?P<data>[.#?]+)")
+MAP_STAT_RE = re.compile(r"MAP STAT\s+(?P<body>.*)")
 POSE_RE = re.compile(r"POSE\s+(-?\d+),(-?\d+),(-?\d+)")
 PATH_BEGIN_RE = re.compile(r"PATH BEGIN seq=(?P<seq>\d+)\s+rev=(?P<rev>\d+)\s+len=(?P<len>\d+)\s+target=(?P<x>\d+),(?P<y>\d+)")
 PATH_CHUNK_RE = re.compile(r"PATH CHUNK seq=(?P<seq>\d+)\s+idx=(?P<idx>\d+)\s+data=(?P<data>.*)")
 PATH_END_RE = re.compile(r"PATH END seq=(?P<seq>\d+)")
 SLAM_HB_RE = re.compile(
-    r"SLAM HB state=(?P<state>\S+)\s+seq=(?P<seq>\d+)\s+target=(?P<x>\d+),(?P<y>\d+)\s+"
-    r"path_i=(?P<path_i>\d+)\s+path_len=(?P<path_len>\d+)\s+front=(?P<front>\d+)\s+rev=(?P<rev>\d+)"
+    r"SLAM HB state=(?P<state>\S+)\s+seq=(?P<seq>\d+)\s+"
+    r"(?:cell=(?P<cell_x>\d+),(?P<cell_y>\d+)\s+)?"
+    r"target=(?P<x>\d+),(?P<y>\d+)\s+path_i=(?P<path_i>\d+)\s+"
+    r"path_len=(?P<path_len>\d+)\s+front=(?P<front>\d+)\s+rev=(?P<rev>\d+)"
 )
 SLAM_STATE_RE = re.compile(r"SLAM state=(?P<state>\S+)\s+reason=(?P<reason>\S+)\s+seq=(?P<seq>\d+).*")
 
@@ -89,6 +92,7 @@ class SlamStatus:
     state: str = "IDLE"
     reason: str = ""
     seq: int = 0
+    cell: Optional[Tuple[int, int]] = None
     target: Optional[Tuple[int, int]] = None
     path_i: int = 0
     path_len: int = 0
@@ -120,6 +124,12 @@ class Model:
     source: str = "offline"
     last_line: str = ""
     raw_log: List[str] = field(default_factory=list)
+    rows_received: int = 0
+    free_cells: int = 0
+    occupied_cells: int = 0
+    unknown_cells: int = GRID_W * GRID_H
+    tx_drops: int = 0
+    inserted_points: int = 0
 
     def reset_grid(self, width: int = GRID_W, height: int = GRID_H, cell_mm: int = CELL_MM) -> None:
         self.width = width
@@ -128,6 +138,7 @@ class Model:
         self.grid = [["?" for _ in range(width)] for _ in range(height)]
         self.path.clear()
         self.pending_path = None
+        self.rows_received = 0
 
 
 class ProtocolParser:
@@ -145,12 +156,18 @@ class ProtocolParser:
             del self.model.raw_log[: len(self.model.raw_log) - LOG_LIMIT]
 
         if match := MAP_HEADER_RE.match(line):
-            self.model.map_state = match.group("state")
+            state = match.group("state")
+            self.model.map_state = state
             width = int(match.group("w"))
             height = int(match.group("h"))
             cell_mm = int(match.group("cell"))
             self.model.revision = int(match.group("rev"))
-            if width != self.model.width or height != self.model.height or cell_mm != self.model.cell_mm:
+            if (
+                state == "START"
+                or width != self.model.width
+                or height != self.model.height
+                or cell_mm != self.model.cell_mm
+            ):
                 self.model.reset_grid(width, height, cell_mm)
             return
 
@@ -163,6 +180,28 @@ class ProtocolParser:
                 if len(row) < self.model.width:
                     row.extend("?" for _ in range(self.model.width - len(row)))
                 self.model.grid[y] = row
+                self.model.rows_received += 1
+            return
+
+        if match := MAP_STAT_RE.match(line):
+            fields = self._parse_key_values(match.group("body"))
+            self.model.revision = int(fields.get("rev", self.model.revision))
+            self.model.inserted_points = int(fields.get("inserted", self.model.inserted_points))
+            self.model.unknown_cells = int(fields.get("unknown", self.model.unknown_cells))
+            self.model.free_cells = int(fields.get("free", self.model.free_cells))
+            self.model.occupied_cells = int(fields.get("occupied", self.model.occupied_cells))
+            self.model.tx_drops = int(fields.get("txdrop", self.model.tx_drops))
+            if "pose" in fields:
+                try:
+                    x_text, y_text, h_text = fields["pose"].split(",", 2)
+                    self.model.pose = Pose(
+                        x_mm=int(x_text),
+                        y_mm=int(y_text),
+                        heading_cdeg=int(h_text),
+                        valid=True,
+                    )
+                except ValueError:
+                    pass
             return
 
         if match := POSE_RE.match(line):
@@ -210,6 +249,8 @@ class ProtocolParser:
         if match := SLAM_HB_RE.match(line):
             self.model.slam.state = match.group("state")
             self.model.slam.seq = int(match.group("seq"))
+            if match.group("cell_x") is not None and match.group("cell_y") is not None:
+                self.model.slam.cell = (int(match.group("cell_x")), int(match.group("cell_y")))
             self.model.slam.target = (int(match.group("x")), int(match.group("y")))
             self.model.slam.path_i = int(match.group("path_i"))
             self.model.slam.path_len = int(match.group("path_len"))
@@ -221,6 +262,16 @@ class ProtocolParser:
             self.model.slam.state = match.group("state")
             self.model.slam.reason = match.group("reason")
             self.model.slam.seq = int(match.group("seq"))
+
+    @staticmethod
+    def _parse_key_values(body: str) -> Dict[str, str]:
+        fields: Dict[str, str] = {}
+        for item in body.split():
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            fields[key] = value
+        return fields
 
 
 class SerialWorker:
@@ -247,6 +298,7 @@ class SerialWorker:
         try:
             self.serial_obj.setDTR(False)
             self.serial_obj.setRTS(False)
+            self.serial_obj.reset_input_buffer()
         except Exception:
             pass
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -341,7 +393,7 @@ class SlamVisualizer(tk.Tk):
         ttk.Button(toolbar, text="Connect", command=self._connect).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Disconnect", command=self._disconnect).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Replay Log", command=self._choose_replay).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="SLAM", command=lambda: self.worker.write_line("SLAM")).pack(side=tk.LEFT, padx=(16, 2))
+        ttk.Button(toolbar, text="SLAM", command=self._start_slam).pack(side=tk.LEFT, padx=(16, 2))
         ttk.Button(toolbar, text="Back", command=lambda: self.worker.write_line("BACK")).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Gyro Cal", command=lambda: self.worker.write_line("GYRO CAL")).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Stop", command=lambda: self.worker.write_line("SLAM OFF")).pack(side=tk.LEFT, padx=2)
@@ -394,6 +446,9 @@ class SlamVisualizer(tk.Tk):
         self.model.connected = True
         self.model.source = port
 
+    def _start_slam(self) -> None:
+        self.worker.write_line("SLAM")
+
     def _disconnect(self) -> None:
         self.worker.disconnect()
         self.model.connected = False
@@ -427,7 +482,8 @@ class SlamVisualizer(tk.Tk):
         self.status_vars["source"].set(("connected " if self.model.connected else "") + self.model.source)
         self.status_vars["map"].set(
             f"MAP {self.model.map_state} {self.model.width}x{self.model.height} "
-            f"cell={self.model.cell_mm}mm rev={self.model.revision}"
+            f"cell={self.model.cell_mm}mm rev={self.model.revision} rows={self.model.rows_received} "
+            f"free={self.model.free_cells} occ={self.model.occupied_cells} txdrop={self.model.tx_drops}"
         )
         if self.model.pose.valid:
             self.status_vars["pose"].set(
@@ -436,7 +492,7 @@ class SlamVisualizer(tk.Tk):
             )
         self.status_vars["slam"].set(
             f"{self.model.slam.state} reason={self.model.slam.reason or '-'} "
-            f"front={self.model.slam.front_mm}mm target={self.model.slam.target}"
+            f"front={self.model.slam.front_mm}mm cell={self.model.slam.cell} target={self.model.slam.target}"
         )
         self.status_vars["path"].set(
             f"seq={self.model.path_seq} len={len(self.model.path)} "

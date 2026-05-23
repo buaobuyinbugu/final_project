@@ -11,7 +11,7 @@ from typing import List, Optional, Set, Tuple
 import serial
 
 
-PORT = "COM3"
+PORT = "COM6"
 BAUDRATE = 115200
 
 DEFAULT_WIDTH = 80

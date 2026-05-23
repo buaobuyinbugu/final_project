@@ -55,8 +55,8 @@
 #define ADC_PWM_MAX_PERMILLE        1000U
 #define ADC_PWM_UPDATE_DEADBAND     8U
 
-#define MAPPING_POINT_BATCH_LIMIT   128U
-#define MAP_ROW_TX_INTERVAL_MS      60U
+#define MAPPING_POINT_BATCH_LIMIT   6U
+#define MAP_ROW_TX_INTERVAL_MS      180U
 #define MAP_STAT_TX_INTERVAL_MS     2000U
 #define POSE_TX_INTERVAL_MS         100U
 #define LIDAR_DEBUG_MAX_TX_PER_BATCH 4U
@@ -140,6 +140,7 @@ osThreadId defaultTaskHandle;
 osThreadId senseTaskHandle;
 osThreadId uiTaskHandle;
 osThreadId btTaskHandle;
+osThreadId lidarAppTaskHandle;
 
 typedef enum
 {
@@ -360,6 +361,7 @@ static int32_t NormalizeHeadingCdeg(int32_t heading_cdeg);
 void StartSenseTask(void const * argument);
 void StartUiTask(void const * argument);
 void StartBtTask(void const * argument);
+void StartLidarAppTask(void const * argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -1009,7 +1011,6 @@ static void TestApp_UpdateSensors(void)
   TestApp_UpdateAngleTurn(now);
   SlamNav_SetControlConfig(GetDrivePwmPermille(), GetTurnPwmPermille(), GetObstacleSafeDistanceMm());
 
-  TestApp_ProcessLidarPoints();
   TestApp_UpdateAutoMapping(now);
   TestApp_UpdateMotorSpeedFromAdc();
 }
@@ -1218,9 +1219,9 @@ static void TestApp_StartMapping(void)
   last_mapping_pose_tick_ms = HAL_GetTick();
   mapping_start_tick_ms = last_mapping_pose_tick_ms;
   TestApp_RecordPoseHistory(last_mapping_pose_tick_ms);
-  last_map_row_tx_tick_ms = 0U;
-  last_map_stat_tx_tick_ms = 0U;
-  last_pose_tx_tick_ms = 0U;
+  last_map_row_tx_tick_ms = last_mapping_pose_tick_ms;
+  last_map_stat_tx_tick_ms = last_mapping_pose_tick_ms;
+  last_pose_tx_tick_ms = last_mapping_pose_tick_ms;
   next_map_tx_row = 0U;
 
   TestApp_SendMapHeader("START");
@@ -1242,9 +1243,9 @@ static void TestApp_ResumeMapping(void)
     mapping_start_tick_ms = now;
   }
   TestApp_RecordPoseHistory(now);
-  last_map_row_tx_tick_ms = 0U;
-  last_map_stat_tx_tick_ms = 0U;
-  last_pose_tx_tick_ms = 0U;
+  last_map_row_tx_tick_ms = now;
+  last_map_stat_tx_tick_ms = now;
+  last_pose_tx_tick_ms = now;
   next_map_tx_row = 0U;
 
   TestApp_SendMapHeader("RESUME");
@@ -2447,7 +2448,8 @@ static void TestApp_StreamMap(void)
 
 static void TestApp_StreamPose(void)
 {
-  char line[64];
+  MotorControlState_t motor_state = {0};
+  char line[128];
   uint32_t now = HAL_GetTick();
 
   if (!mapping_active)
@@ -2461,13 +2463,20 @@ static void TestApp_StreamPose(void)
   }
   last_pose_tx_tick_ms = now;
 
+  (void)MotorControl_GetState(&motor_state);
   (void)snprintf(
       line,
       sizeof(line),
-      "POSE %ld,%ld,%ld\r\n",
+      "POSE %ld,%ld,%ld mpu=%u gz=%ld ld=%d rd=%d mode=%u fw=%u\r\n",
       (long)mapping_pose.x_mm,
       (long)mapping_pose.y_mm,
-      (long)mapping_pose.heading_cdeg);
+      (long)mapping_pose.heading_cdeg,
+      (unsigned int)mpu_state.ready,
+      (long)gyro_z_corrected_dps_x100,
+      (int)encoder_test.left_delta,
+      (int)encoder_test.right_delta,
+      (unsigned int)motor_state.mode,
+      (unsigned int)motor_state.forward_active);
   (void)BluetoothControl_SendText(line);
 }
 
@@ -2687,8 +2696,11 @@ int main(void)
   osThreadDef(uiTask, StartUiTask, osPriorityBelowNormal, 0, 512);
   uiTaskHandle = osThreadCreate(osThread(uiTask), NULL);
 
-  osThreadDef(btTask, StartBtTask, osPriorityNormal, 0, 256);
+  osThreadDef(btTask, StartBtTask, osPriorityHigh, 0, 384);
   btTaskHandle = osThreadCreate(osThread(btTask), NULL);
+
+  osThreadDef(lidarAppTask, StartLidarAppTask, osPriorityBelowNormal, 0, 384);
+  lidarAppTaskHandle = osThreadCreate(osThread(lidarAppTask), NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -3324,6 +3336,29 @@ void StartBtTask(void const * argument)
     osDelay(20);
   }
   /* USER CODE END StartBtTask */
+}
+
+/* USER CODE BEGIN Header_StartLidarAppTask */
+/**
+  * @brief  Function implementing the lidarAppTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartLidarAppTask */
+void StartLidarAppTask(void const * argument)
+{
+  /* USER CODE BEGIN StartLidarAppTask */
+  (void)argument;
+
+  for(;;)
+  {
+    if (app_ready)
+    {
+      TestApp_ProcessLidarPoints();
+    }
+    osDelay(5);
+  }
+  /* USER CODE END StartLidarAppTask */
 }
 
 /**

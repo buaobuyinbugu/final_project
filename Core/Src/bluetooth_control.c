@@ -10,15 +10,17 @@
 extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart6;
 
-#define BLUETOOTH_RX_LINE_QUEUE_LENGTH 4U
-#define BLUETOOTH_COMMAND_QUEUE_LENGTH 8U
-#define BLUETOOTH_TX_LINE_QUEUE_LENGTH 32U
+#define BLUETOOTH_RX_LINE_QUEUE_LENGTH 8U
+#define BLUETOOTH_COMMAND_QUEUE_LENGTH 12U
+#define BLUETOOTH_TX_LINE_QUEUE_LENGTH 48U
 #define BLUETOOTH_TX_LINE_MAX          256U
 #define BLUETOOTH_TX_TASK_STACK_WORDS  384U
 #define BLUETOOTH_TX_TASK_PRIORITY     (tskIDLE_PRIORITY + 1U)
 #define BLUETOOTH_TX_TIMEOUT_MS        30U
 #define BLUETOOTH_RX_LINE_IDLE_MS      120U
 #define BLUETOOTH_RETRY_RX_MS          1000U
+#define BLUETOOTH_BT_MAP_ROW_INTERVAL_MS 180U
+#define BLUETOOTH_BT_POSE_INTERVAL_MS    250U
 #define BLUETOOTH_RX_ONLY_DEBUG        0U
 
 typedef struct
@@ -62,6 +64,8 @@ static BluetoothRxContext_t s_rx_uart6;
 static BluetoothRxContext_t s_rx_uart2;
 static bool s_initialized;
 static uint32_t s_last_rx_retry_tick_ms;
+static uint32_t s_last_bt_map_row_tick_ms;
+static uint32_t s_last_bt_pose_tick_ms;
 
 static bool BluetoothControl_StartReceive(void);
 static bool BluetoothControl_StartReceiveContext(BluetoothRxContext_t *context);
@@ -69,6 +73,9 @@ static BluetoothRxContext_t *BluetoothControl_GetRxContext(UART_HandleTypeDef *h
 static bool BluetoothControl_SendBytesBlocking(const uint8_t *data, uint16_t length);
 static bool BluetoothControl_ShouldSendToBluetooth(const uint8_t *data, uint16_t length);
 static bool BluetoothControl_HasPrefix(const uint8_t *data, uint16_t length, const char *prefix);
+static bool BluetoothControl_ShouldPreserveTxLine(const char *text);
+static bool BluetoothControl_IsPriorityTxLine(const char *text);
+static bool BluetoothControl_IsUrgentCommand(BluetoothCommandType_t command);
 static void BluetoothControl_TxTask(void *argument);
 static void BluetoothControl_FlushIdleRxLines(uint32_t now);
 static void BluetoothControl_FlushIdleRxContext(BluetoothRxContext_t *context, uint32_t now);
@@ -208,8 +215,48 @@ bool BluetoothControl_SendText(const char *text)
   memcpy(tx_line.text, text, length);
   tx_line.text[length] = '\0';
 
+  if (BluetoothControl_IsPriorityTxLine(tx_line.text))
+  {
+    if (xQueueSendToFront(s_tx_line_queue, &tx_line, 0U) == pdPASS)
+    {
+      return true;
+    }
+
+    {
+      BluetoothTxLine_t dropped_line;
+
+      (void)xQueueReceive(s_tx_line_queue, &dropped_line, 0U);
+    }
+    if (xQueueSendToFront(s_tx_line_queue, &tx_line, 0U) == pdPASS)
+    {
+      taskENTER_CRITICAL();
+      s_state.tx_drops++;
+      taskEXIT_CRITICAL();
+      return true;
+    }
+
+    taskENTER_CRITICAL();
+    s_state.tx_drops++;
+    taskEXIT_CRITICAL();
+    return false;
+  }
+
   if (xQueueSend(s_tx_line_queue, &tx_line, 0U) != pdPASS)
   {
+    if (BluetoothControl_ShouldPreserveTxLine(tx_line.text))
+    {
+      BluetoothTxLine_t dropped_line;
+
+      (void)xQueueReceive(s_tx_line_queue, &dropped_line, 0U);
+      if (xQueueSend(s_tx_line_queue, &tx_line, 0U) == pdPASS)
+      {
+        taskENTER_CRITICAL();
+        s_state.tx_drops++;
+        taskEXIT_CRITICAL();
+        return true;
+      }
+    }
+
     taskENTER_CRITICAL();
     s_state.tx_drops++;
     taskEXIT_CRITICAL();
@@ -252,20 +299,80 @@ static bool BluetoothControl_SendBytesBlocking(const uint8_t *data, uint16_t len
 
 static bool BluetoothControl_ShouldSendToBluetooth(const uint8_t *data, uint16_t length)
 {
+  uint32_t now;
+
   if ((data == NULL) || (length == 0U))
   {
     return true;
   }
 
-  if (BluetoothControl_HasPrefix(data, length, "MAP ROW ") ||
-      BluetoothControl_HasPrefix(data, length, "POSE ") ||
-      BluetoothControl_HasPrefix(data, length, "PATH CHUNK ") ||
-      BluetoothControl_HasPrefix(data, length, "LP "))
+  if (BluetoothControl_HasPrefix(data, length, "LP ") ||
+      BluetoothControl_HasPrefix(data, length, "ODOM "))
   {
     return false;
   }
 
+  now = HAL_GetTick();
+  if (BluetoothControl_HasPrefix(data, length, "MAP ROW "))
+  {
+    if ((now - s_last_bt_map_row_tick_ms) < BLUETOOTH_BT_MAP_ROW_INTERVAL_MS)
+    {
+      return false;
+    }
+    s_last_bt_map_row_tick_ms = now;
+  }
+  else if (BluetoothControl_HasPrefix(data, length, "POSE "))
+  {
+    if ((now - s_last_bt_pose_tick_ms) < BLUETOOTH_BT_POSE_INTERVAL_MS)
+    {
+      return false;
+    }
+    s_last_bt_pose_tick_ms = now;
+  }
+
   return true;
+}
+
+static bool BluetoothControl_ShouldPreserveTxLine(const char *text)
+{
+  if (text == NULL)
+  {
+    return false;
+  }
+
+  return (strncmp(text, "MAP ", 4U) == 0) ||
+         (strncmp(text, "MAP STAT ", 9U) == 0) ||
+         (strncmp(text, "POSE ", 5U) == 0) ||
+         (strncmp(text, "PATH ", 5U) == 0) ||
+         (strncmp(text, "SLAM HB ", 8U) == 0);
+}
+
+static bool BluetoothControl_IsPriorityTxLine(const char *text)
+{
+  if (text == NULL)
+  {
+    return false;
+  }
+
+  return (strncmp(text, "ACK ", 4U) == 0) ||
+         (strncmp(text, "ERR ", 4U) == 0) ||
+         (strncmp(text, "EMERGENCY", 9U) == 0) ||
+         (strncmp(text, "MOTOR ", 6U) == 0) ||
+         (strncmp(text, "SLAM STOP", 9U) == 0) ||
+         (strncmp(text, "MAP STOP", 8U) == 0) ||
+         (strncmp(text, "GYRO CAL", 8U) == 0) ||
+         (strncmp(text, "MPU STATE", 9U) == 0) ||
+         (strncmp(text, "DIR ", 4U) == 0) ||
+         (strncmp(text, "LIDAR FRONT", 11U) == 0);
+}
+
+static bool BluetoothControl_IsUrgentCommand(BluetoothCommandType_t command)
+{
+  return (command == BLUETOOTH_CMD_STOP_ALL) ||
+         (command == BLUETOOTH_CMD_DRIVE_STOP) ||
+         (command == BLUETOOTH_CMD_SLAM_NAV_OFF) ||
+         (command == BLUETOOTH_CMD_AUTO_MAPPING_OFF) ||
+         (command == BLUETOOTH_CMD_STOP_MAPPING);
 }
 
 static bool BluetoothControl_HasPrefix(const uint8_t *data, uint16_t length, const char *prefix)
@@ -494,6 +601,7 @@ static void BluetoothControl_FlushIdleRxContext(BluetoothRxContext_t *context, u
 static void BluetoothControl_QueueLine(const char *text, uint32_t tick_ms)
 {
   BluetoothLine_t completed_line;
+  BluetoothLine_t dropped_line;
 
   if ((text == NULL) || (s_rx_line_queue == NULL))
   {
@@ -506,6 +614,13 @@ static void BluetoothControl_QueueLine(const char *text, uint32_t tick_ms)
 
   if (xQueueSend(s_rx_line_queue, &completed_line, 0U) != pdPASS)
   {
+    (void)xQueueReceive(s_rx_line_queue, &dropped_line, 0U);
+    if (xQueueSend(s_rx_line_queue, &completed_line, 0U) == pdPASS)
+    {
+      s_state.command_drops++;
+      return;
+    }
+
     s_state.command_drops++;
   }
 }
@@ -869,8 +984,36 @@ static void BluetoothControl_QueueCommand(BluetoothCommandType_t command, const 
   item.tick_count = tick_ms;
   strncpy(item.text, text, sizeof(item.text) - 1U);
 
+  if (BluetoothControl_IsUrgentCommand(command))
+  {
+    if (xQueueSendToFront(s_command_queue, &item, 0U) == pdPASS)
+    {
+      return;
+    }
+
+    {
+      BluetoothCommand_t dropped_item;
+
+      (void)xQueueReceive(s_command_queue, &dropped_item, 0U);
+    }
+    if (xQueueSendToFront(s_command_queue, &item, 0U) == pdPASS)
+    {
+      s_state.command_drops++;
+      return;
+    }
+  }
+
   if (xQueueSend(s_command_queue, &item, 0U) != pdPASS)
   {
+    BluetoothCommand_t dropped_item;
+
+    (void)xQueueReceive(s_command_queue, &dropped_item, 0U);
+    if (xQueueSend(s_command_queue, &item, 0U) == pdPASS)
+    {
+      s_state.command_drops++;
+      return;
+    }
+
     s_state.command_drops++;
   }
 }
@@ -886,6 +1029,7 @@ static void BluetoothControl_SendAck(BluetoothCommandType_t command)
 static void BluetoothControl_QueueLineFromIsr(const char *text, BaseType_t *higher_priority_task_woken)
 {
   BluetoothLine_t completed_line;
+  BluetoothLine_t dropped_line;
 
   if ((text == NULL) || (s_rx_line_queue == NULL))
   {
@@ -898,6 +1042,13 @@ static void BluetoothControl_QueueLineFromIsr(const char *text, BaseType_t *high
 
   if (xQueueSendFromISR(s_rx_line_queue, &completed_line, higher_priority_task_woken) != pdPASS)
   {
+    (void)xQueueReceiveFromISR(s_rx_line_queue, &dropped_line, higher_priority_task_woken);
+    if (xQueueSendFromISR(s_rx_line_queue, &completed_line, higher_priority_task_woken) == pdPASS)
+    {
+      s_state.command_drops++;
+      return;
+    }
+
     s_state.command_drops++;
   }
 }

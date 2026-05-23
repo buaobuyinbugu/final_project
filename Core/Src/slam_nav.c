@@ -21,16 +21,21 @@
 #define SLAM_NAV_DEFAULT_SAFE_MM        350U
 #define SLAM_NAV_MAX_PWM                1000U
 #define SLAM_NAV_MIN_SAFE_MM            350U
+#define SLAM_NAV_LOCAL_CLEARANCE_MM     300U
 #define SLAM_NAV_MIN_DRIVE_PWM          380U
 #define SLAM_NAV_MIN_TURN_PWM           380U
 #define SLAM_NAV_FRONT_SECTOR_CDEG      3000U
 #define SLAM_NAV_FRONT_BLOCK_HOLD_MS    600U
 #define SLAM_NAV_TURN_TOL_CDEG          1200L
 #define SLAM_NAV_DRIVE_HEADING_TOL_CDEG 2600L
-#define SLAM_NAV_TARGET_RADIUS_MM       40L
+#define SLAM_NAV_TARGET_RADIUS_MM       15L
 #define SLAM_NAV_ROBOT_FREE_RADIUS      1U
 #define SLAM_NAV_HEARTBEAT_INTERVAL_MS  500U
+#define SLAM_NAV_STATUS_INTERVAL_MS     300U
+#define SLAM_NAV_PATH_TX_INTERVAL_MS    1000U
 #define SLAM_NAV_PATH_CHUNK_CELLS       10U
+#define SLAM_NAV_TURN_TIMEOUT_MS        6000U
+#define SLAM_NAV_BLOCKED_REPLAN_WAIT_MS 600U
 
 typedef enum
 {
@@ -79,6 +84,13 @@ static int32_t s_target_y_mm;
 static int32_t s_target_heading_cdeg;
 static uint32_t s_plan_seq;
 static uint32_t s_last_heartbeat_tick_ms;
+static uint32_t s_last_status_tick_ms;
+static uint32_t s_last_path_tx_tick_ms;
+static uint32_t s_state_enter_tick_ms;
+static uint32_t s_replan_after_tick_ms;
+static bool s_last_path_tx_valid;
+static AstarPlannerCell_t s_last_path_tx_target;
+static uint16_t s_last_path_tx_length;
 static int32_t s_return_goal_x_mm;
 static int32_t s_return_goal_y_mm;
 
@@ -98,6 +110,7 @@ static int32_t SlamNav_NormalizeHeadingCdeg(int32_t heading_cdeg);
 static int32_t SlamNav_SignedHeadingErrorCdeg(int32_t target_cdeg, int32_t current_cdeg);
 static int32_t SlamNav_Abs32(int32_t value);
 static uint16_t SlamNav_ClampPwm(uint16_t value);
+static uint16_t SlamNav_LocalBlockDistanceMm(uint16_t configured_safe_mm);
 static uint16_t SlamNav_ActivePwm(uint16_t configured_pwm, uint16_t fallback_pwm, uint16_t minimum_pwm);
 static int32_t SlamNav_CellHeadingCdeg(const AstarPlannerCell_t *from, const AstarPlannerCell_t *to);
 static void SlamNav_SendStatus(const char *state, const char *reason);
@@ -209,6 +222,7 @@ void SlamNav_SetControlConfig(uint16_t drive_pwm_permille,
 void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
 {
   uint16_t safe_mm;
+  uint16_t local_block_mm;
 
   if ((point == NULL) ||
       !s_active ||
@@ -223,7 +237,8 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
   safe_mm = s_safe_distance_mm;
   taskEXIT_CRITICAL();
 
-  if (point->distance_mm <= safe_mm)
+  local_block_mm = SlamNav_LocalBlockDistanceMm(safe_mm);
+  if (point->distance_mm <= local_block_mm)
   {
     taskENTER_CRITICAL();
     s_front_blocked_until_ms = HAL_GetTick() + SLAM_NAV_FRONT_BLOCK_HOLD_MS;
@@ -298,8 +313,12 @@ static void SlamNav_Update(void)
 
   if ((s_state == SLAM_NAV_STATE_DRIVE) && SlamNav_IsFrontBlocked())
   {
+    uint32_t now = HAL_GetTick();
+
     MotorControl_Stop();
     s_state = SLAM_NAV_STATE_REPLAN;
+    s_state_enter_tick_ms = now;
+    s_replan_after_tick_ms = now + SLAM_NAV_BLOCKED_REPLAN_WAIT_MS;
     SlamNav_SendStatus("REPLAN", "BLOCKED");
   }
 
@@ -329,11 +348,17 @@ static void SlamNav_StartInternal(SlamNavMode_t mode, int32_t goal_x_mm, int32_t
   s_active = true;
   s_mode = mode;
   s_state = SLAM_NAV_STATE_PLAN;
+  s_state_enter_tick_ms = HAL_GetTick();
   s_front_blocked_until_ms = 0U;
   s_front_min_distance_mm = 0U;
   s_path_index = 0U;
   s_plan_seq = 0U;
+  s_replan_after_tick_ms = 0U;
   s_last_heartbeat_tick_ms = 0U;
+  s_last_status_tick_ms = 0U;
+  s_last_path_tx_tick_ms = 0U;
+  s_last_path_tx_valid = false;
+  s_last_path_tx_length = 0U;
   s_return_goal_x_mm = goal_x_mm;
   s_return_goal_y_mm = goal_y_mm;
   taskEXIT_CRITICAL();
@@ -351,8 +376,11 @@ static void SlamNav_StopInternal(const char *reason, bool send_status)
   s_active = false;
   s_mode = SLAM_NAV_MODE_EXPLORE;
   s_state = SLAM_NAV_STATE_IDLE;
+  s_state_enter_tick_ms = HAL_GetTick();
   s_front_blocked_until_ms = 0U;
   s_front_min_distance_mm = 0U;
+  s_last_path_tx_valid = false;
+  s_replan_after_tick_ms = 0U;
   taskEXIT_CRITICAL();
 
   if (was_active)
@@ -369,6 +397,7 @@ static void SlamNav_StopInternal(const char *reason, bool send_status)
 static void SlamNav_UpdatePlan(void)
 {
   MappingGridPose_t pose;
+  uint32_t now = HAL_GetTick();
   uint8_t start_x;
   uint8_t start_y;
   uint8_t goal_x = 0U;
@@ -378,9 +407,25 @@ static void SlamNav_UpdatePlan(void)
   int32_t return_goal_x_mm;
   int32_t return_goal_y_mm;
 
+  if ((s_replan_after_tick_ms != 0U) &&
+      ((int32_t)(now - s_replan_after_tick_ms) < 0L))
+  {
+    SlamNav_SendStatus("REPLAN", "BLOCK_WAIT");
+    return;
+  }
+  s_replan_after_tick_ms = 0U;
+
+  if (SlamNav_IsFrontBlocked())
+  {
+    s_replan_after_tick_ms = now + SLAM_NAV_BLOCKED_REPLAN_WAIT_MS;
+    SlamNav_SendStatus("REPLAN", "BLOCK_WAIT");
+    return;
+  }
+
   if (!SlamNav_GetPoseAndCell(&pose, &start_x, &start_y))
   {
     s_state = SLAM_NAV_STATE_NO_PATH;
+    s_state_enter_tick_ms = HAL_GetTick();
     s_active = false;
     MotorControl_Stop();
     SlamNav_SendStatus("NO_PATH", "BAD_POSE");
@@ -391,6 +436,7 @@ static void SlamNav_UpdatePlan(void)
   if (!MappingGrid_CopySnapshot(&s_snapshot))
   {
     s_state = SLAM_NAV_STATE_NO_PATH;
+    s_state_enter_tick_ms = HAL_GetTick();
     s_active = false;
     MotorControl_Stop();
     SlamNav_SendStatus("NO_PATH", "SNAPSHOT");
@@ -408,6 +454,7 @@ static void SlamNav_UpdatePlan(void)
     if (!MappingGrid_WorldToCell(return_goal_x_mm, return_goal_y_mm, &goal_x, &goal_y))
     {
       s_state = SLAM_NAV_STATE_NO_PATH;
+      s_state_enter_tick_ms = HAL_GetTick();
       s_active = false;
       MotorControl_Stop();
       SlamNav_SendStatus("NO_PATH", "RETURN_GOAL");
@@ -417,6 +464,7 @@ static void SlamNav_UpdatePlan(void)
     if ((start_x == goal_x) && (start_y == goal_y))
     {
       s_state = SLAM_NAV_STATE_DONE;
+      s_state_enter_tick_ms = HAL_GetTick();
       s_active = false;
       MotorControl_Stop();
       s_path.length = 1U;
@@ -440,6 +488,7 @@ static void SlamNav_UpdatePlan(void)
       (s_path.length < 2U))
   {
     s_state = SLAM_NAV_STATE_NO_PATH;
+    s_state_enter_tick_ms = HAL_GetTick();
     s_active = false;
     MotorControl_Stop();
     SlamNav_SendStatus("NO_PATH", AstarPlanner_StatusName(status));
@@ -449,6 +498,7 @@ static void SlamNav_UpdatePlan(void)
   if (!SlamNav_SetTargetFromPath(1U))
   {
     s_state = SLAM_NAV_STATE_NO_PATH;
+    s_state_enter_tick_ms = HAL_GetTick();
     s_active = false;
     MotorControl_Stop();
     SlamNav_SendStatus("NO_PATH", "TARGET");
@@ -456,6 +506,7 @@ static void SlamNav_UpdatePlan(void)
   }
 
   s_state = SLAM_NAV_STATE_TURN;
+  s_state_enter_tick_ms = HAL_GetTick();
   SlamNav_SendPath();
   SlamNav_SendStatus((mode == SLAM_NAV_MODE_RETURN) ? "RETURN" : "PLAN", AstarPlanner_StatusName(status));
 }
@@ -469,6 +520,7 @@ static void SlamNav_UpdateTurn(void)
   if (!MappingGrid_GetPose(&pose))
   {
     s_state = SLAM_NAV_STATE_REPLAN;
+    s_state_enter_tick_ms = HAL_GetTick();
     return;
   }
 
@@ -477,6 +529,17 @@ static void SlamNav_UpdateTurn(void)
   {
     MotorControl_Stop();
     s_state = SLAM_NAV_STATE_DRIVE;
+    s_state_enter_tick_ms = HAL_GetTick();
+    return;
+  }
+
+  if ((HAL_GetTick() - s_state_enter_tick_ms) >= SLAM_NAV_TURN_TIMEOUT_MS)
+  {
+    MotorControl_Stop();
+    s_state = SLAM_NAV_STATE_NO_PATH;
+    s_state_enter_tick_ms = HAL_GetTick();
+    s_active = false;
+    SlamNav_SendStatus("NO_PATH", "HEADING_TIMEOUT");
     return;
   }
 
@@ -504,6 +567,7 @@ static void SlamNav_UpdateDrive(void)
   if (!SlamNav_GetPoseAndCell(&pose, &current_x, &current_y))
   {
     s_state = SLAM_NAV_STATE_REPLAN;
+    s_state_enter_tick_ms = HAL_GetTick();
     return;
   }
 
@@ -511,6 +575,7 @@ static void SlamNav_UpdateDrive(void)
   {
     MotorControl_Stop();
     s_state = SLAM_NAV_STATE_REPLAN;
+    s_state_enter_tick_ms = HAL_GetTick();
     SlamNav_SendStatus("REPLAN", "TARGET_BLOCKED");
     return;
   }
@@ -523,6 +588,7 @@ static void SlamNav_UpdateDrive(void)
   {
     MotorControl_Stop();
     s_state = SLAM_NAV_STATE_PLAN;
+    s_state_enter_tick_ms = HAL_GetTick();
     SlamNav_SendStatus("CELL", "REACHED");
     return;
   }
@@ -532,6 +598,7 @@ static void SlamNav_UpdateDrive(void)
   {
     MotorControl_Stop();
     s_state = SLAM_NAV_STATE_TURN;
+    s_state_enter_tick_ms = HAL_GetTick();
     return;
   }
 
@@ -644,6 +711,18 @@ static uint16_t SlamNav_ClampPwm(uint16_t value)
   return (value > SLAM_NAV_MAX_PWM) ? SLAM_NAV_MAX_PWM : value;
 }
 
+static uint16_t SlamNav_LocalBlockDistanceMm(uint16_t configured_safe_mm)
+{
+  uint16_t local_limit_mm = (uint16_t)(MAPPING_GRID_CELL_SIZE_MM + SLAM_NAV_LOCAL_CLEARANCE_MM);
+
+  if (configured_safe_mm < SLAM_NAV_MIN_SAFE_MM)
+  {
+    configured_safe_mm = SLAM_NAV_MIN_SAFE_MM;
+  }
+
+  return (configured_safe_mm > local_limit_mm) ? local_limit_mm : configured_safe_mm;
+}
+
 static uint16_t SlamNav_ActivePwm(uint16_t configured_pwm, uint16_t fallback_pwm, uint16_t minimum_pwm)
 {
   uint16_t pwm = (configured_pwm > 0U) ? configured_pwm : fallback_pwm;
@@ -684,6 +763,8 @@ static int32_t SlamNav_CellHeadingCdeg(const AstarPlannerCell_t *from, const Ast
 static void SlamNav_SendStatus(const char *state, const char *reason)
 {
   char line[128];
+  uint32_t now = HAL_GetTick();
+  bool low_priority_status = false;
 
   if (state == NULL)
   {
@@ -694,6 +775,19 @@ static void SlamNav_SendStatus(const char *state, const char *reason)
   {
     reason = "NONE";
   }
+
+  low_priority_status =
+      (strcmp(state, "CELL") == 0) ||
+      (strcmp(state, "PLAN") == 0) ||
+      (strcmp(state, "RETURN") == 0) ||
+      (strcmp(state, "REPLAN") == 0);
+
+  if (low_priority_status &&
+      ((now - s_last_status_tick_ms) < SLAM_NAV_STATUS_INTERVAL_MS))
+  {
+    return;
+  }
+  s_last_status_tick_ms = now;
 
   (void)snprintf(
       line,
@@ -711,9 +805,15 @@ static void SlamNav_SendStatus(const char *state, const char *reason)
 
 static void SlamNav_SendHeartbeatIfDue(void)
 {
-  char line[128];
+  char line[192];
   uint32_t now = HAL_GetTick();
   uint32_t revision = MappingGrid_GetRevision();
+  uint16_t configured_safe_mm;
+  uint16_t local_block_mm;
+  MappingGridPose_t pose;
+  uint8_t cell_x = 0U;
+  uint8_t cell_y = 0U;
+  bool pose_ok;
 
   if ((now - s_last_heartbeat_tick_ms) < SLAM_NAV_HEARTBEAT_INTERVAL_MS)
   {
@@ -721,18 +821,32 @@ static void SlamNav_SendHeartbeatIfDue(void)
   }
   s_last_heartbeat_tick_ms = now;
 
+  taskENTER_CRITICAL();
+  configured_safe_mm = s_safe_distance_mm;
+  taskEXIT_CRITICAL();
+  local_block_mm = SlamNav_LocalBlockDistanceMm(configured_safe_mm);
+
+  pose_ok = SlamNav_GetPoseAndCell(&pose, &cell_x, &cell_y);
   (void)snprintf(
       line,
       sizeof(line),
-      "SLAM HB state=%s seq=%lu target=%u,%u path_i=%u path_len=%u front=%u rev=%lu\r\n",
+      "SLAM HB state=%s seq=%lu cell=%u,%u target=%u,%u path_i=%u path_len=%u front=%u rev=%lu safe=%u adc_safe=%u pose=%ld,%ld,%ld ok=%u\r\n",
       SlamNav_StateName(s_state),
       (unsigned long)s_plan_seq,
+      (unsigned int)cell_x,
+      (unsigned int)cell_y,
       (unsigned int)s_current_target_cell.x,
       (unsigned int)s_current_target_cell.y,
       (unsigned int)s_path_index,
       (unsigned int)s_path.length,
       (unsigned int)s_front_min_distance_mm,
-      (unsigned long)revision);
+      (unsigned long)revision,
+      (unsigned int)local_block_mm,
+      (unsigned int)configured_safe_mm,
+      pose_ok ? (long)pose.x_mm : 0L,
+      pose_ok ? (long)pose.y_mm : 0L,
+      pose_ok ? (long)pose.heading_cdeg : 0L,
+      (unsigned int)pose_ok);
   (void)BluetoothControl_SendText(line);
 }
 
@@ -740,7 +854,26 @@ static void SlamNav_SendPath(void)
 {
   char line[128];
   uint16_t index = 0U;
+  uint32_t now = HAL_GetTick();
   uint32_t revision = MappingGrid_GetRevision();
+  bool same_path_target;
+
+  same_path_target =
+      s_last_path_tx_valid &&
+      (s_last_path_tx_target.x == s_path.target.x) &&
+      (s_last_path_tx_target.y == s_path.target.y) &&
+      (s_last_path_tx_length == s_path.length);
+
+  if (same_path_target &&
+      ((now - s_last_path_tx_tick_ms) < SLAM_NAV_PATH_TX_INTERVAL_MS))
+  {
+    return;
+  }
+
+  s_last_path_tx_tick_ms = now;
+  s_last_path_tx_target = s_path.target;
+  s_last_path_tx_length = s_path.length;
+  s_last_path_tx_valid = true;
 
   (void)snprintf(
       line,
