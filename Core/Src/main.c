@@ -56,7 +56,8 @@
 #define ADC_PWM_UPDATE_DEADBAND     8U
 
 #define MAPPING_POINT_BATCH_LIMIT   6U
-#define MAP_ROW_TX_INTERVAL_MS      180U
+#define MAP_ROW_TX_INTERVAL_MS      30U
+#define MAP_ROWS_PER_TX_BURST       2U
 #define MAP_STAT_TX_INTERVAL_MS     2000U
 #define POSE_TX_INTERVAL_MS         100U
 #define LIDAR_DEBUG_MAX_TX_PER_BATCH 4U
@@ -2407,6 +2408,7 @@ static void TestApp_StreamMap(void)
   char line[MAPPING_GRID_WIDTH_CELLS + 48U];
   uint32_t now = HAL_GetTick();
   uint32_t revision;
+  uint8_t rows_sent = 0U;
 
   if (!mapping_active)
   {
@@ -2427,22 +2429,26 @@ static void TestApp_StreamMap(void)
   last_map_row_tx_tick_ms = now;
   revision = MappingGrid_GetRevision();
 
-  if (MappingGrid_FormatRow(next_map_tx_row, row_text, sizeof(row_text)))
+  while (rows_sent < MAP_ROWS_PER_TX_BURST)
   {
-    (void)snprintf(
-        line,
-        sizeof(line),
-        "MAP ROW y=%u rev=%lu data=%s\r\n",
-        (unsigned int)next_map_tx_row,
-        (unsigned long)revision,
-        row_text);
-    (void)BluetoothControl_SendText(line);
-  }
+    if (MappingGrid_FormatRow(next_map_tx_row, row_text, sizeof(row_text)))
+    {
+      (void)snprintf(
+          line,
+          sizeof(line),
+          "MAP ROW y=%u rev=%lu data=%s\r\n",
+          (unsigned int)next_map_tx_row,
+          (unsigned long)revision,
+          row_text);
+      (void)BluetoothControl_SendText(line);
+    }
 
-  next_map_tx_row++;
-  if (next_map_tx_row >= MAPPING_GRID_HEIGHT_CELLS)
-  {
-    next_map_tx_row = 0U;
+    next_map_tx_row++;
+    if (next_map_tx_row >= MAPPING_GRID_HEIGHT_CELLS)
+    {
+      next_map_tx_row = 0U;
+    }
+    rows_sent++;
   }
 }
 

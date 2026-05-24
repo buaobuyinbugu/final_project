@@ -12,15 +12,15 @@ extern UART_HandleTypeDef huart6;
 
 #define BLUETOOTH_RX_LINE_QUEUE_LENGTH 8U
 #define BLUETOOTH_COMMAND_QUEUE_LENGTH 12U
-#define BLUETOOTH_TX_LINE_QUEUE_LENGTH 48U
+#define BLUETOOTH_TX_LINE_QUEUE_LENGTH 64U
 #define BLUETOOTH_TX_LINE_MAX          256U
 #define BLUETOOTH_TX_TASK_STACK_WORDS  384U
 #define BLUETOOTH_TX_TASK_PRIORITY     (tskIDLE_PRIORITY + 1U)
 #define BLUETOOTH_TX_TIMEOUT_MS        30U
 #define BLUETOOTH_RX_LINE_IDLE_MS      120U
 #define BLUETOOTH_RETRY_RX_MS          1000U
-#define BLUETOOTH_BT_MAP_ROW_INTERVAL_MS 180U
-#define BLUETOOTH_BT_POSE_INTERVAL_MS    250U
+#define BLUETOOTH_BT_MAP_ROW_INTERVAL_MS 0U
+#define BLUETOOTH_BT_POSE_INTERVAL_MS    100U
 #define BLUETOOTH_RX_ONLY_DEBUG        0U
 
 typedef struct
@@ -315,7 +315,8 @@ static bool BluetoothControl_ShouldSendToBluetooth(const uint8_t *data, uint16_t
   now = HAL_GetTick();
   if (BluetoothControl_HasPrefix(data, length, "MAP ROW "))
   {
-    if ((now - s_last_bt_map_row_tick_ms) < BLUETOOTH_BT_MAP_ROW_INTERVAL_MS)
+    if ((BLUETOOTH_BT_MAP_ROW_INTERVAL_MS > 0U) &&
+        ((now - s_last_bt_map_row_tick_ms) < BLUETOOTH_BT_MAP_ROW_INTERVAL_MS))
     {
       return false;
     }
@@ -340,7 +341,10 @@ static bool BluetoothControl_ShouldPreserveTxLine(const char *text)
     return false;
   }
 
-  return (strncmp(text, "MAP ", 4U) == 0) ||
+  return (strncmp(text, "MAP START ", 10U) == 0) ||
+         (strncmp(text, "MAP SNAP ", 9U) == 0) ||
+         (strncmp(text, "MAP STOP ", 9U) == 0) ||
+         (strncmp(text, "MAP IDLE ", 9U) == 0) ||
          (strncmp(text, "MAP STAT ", 9U) == 0) ||
          (strncmp(text, "POSE ", 5U) == 0) ||
          (strncmp(text, "PATH ", 5U) == 0) ||

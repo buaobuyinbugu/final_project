@@ -36,6 +36,7 @@ GRID_H = 80
 CELL_MM = 50
 CANVAS_SIZE = 720
 LOG_LIMIT = 300
+LOG_SUPPRESSED_PREFIXES = ("MAP ROW ",)
 BLUETOOTH_KEYWORDS = ("bluetooth", "standard serial over bluetooth", "bth", "spp")
 
 MAP_HEADER_RE = re.compile(r"MAP\s+(?P<state>\S+).*w=(?P<w>\d+)\s+h=(?P<h>\d+)\s+cell=(?P<cell>\d+)mm\s+rev=(?P<rev>\d+)")
@@ -151,9 +152,10 @@ class ProtocolParser:
             return
 
         self.model.last_line = line
-        self.model.raw_log.append(line)
-        if len(self.model.raw_log) > LOG_LIMIT:
-            del self.model.raw_log[: len(self.model.raw_log) - LOG_LIMIT]
+        if not line.startswith(LOG_SUPPRESSED_PREFIXES):
+            self.model.raw_log.append(line)
+            if len(self.model.raw_log) > LOG_LIMIT:
+                del self.model.raw_log[: len(self.model.raw_log) - LOG_LIMIT]
 
         if match := MAP_HEADER_RE.match(line):
             state = match.group("state")
