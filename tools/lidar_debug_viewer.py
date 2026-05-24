@@ -11,7 +11,7 @@ from tkinter import ttk
 import serial
 
 
-PORT = "COM3"
+PORT = "COM6"
 BAUDRATE = 115200
 CANVAS_PX = 720
 MAX_RANGE_MM = 8000
