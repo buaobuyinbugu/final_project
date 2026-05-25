@@ -428,6 +428,7 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_LIDAR_DEBUG_OFF: return "LIDAR_DEBUG_OFF";
     case BLUETOOTH_CMD_ODOM_DEBUG_ON:   return "ODOM_DEBUG_ON";
     case BLUETOOTH_CMD_ODOM_DEBUG_OFF:  return "ODOM_DEBUG_OFF";
+    case BLUETOOTH_CMD_ENCODER_CAL_END: return "ENCODER_CAL_END";
     case BLUETOOTH_CMD_AUTO_MAPPING_ON: return "AUTO_MAPPING_ON";
     case BLUETOOTH_CMD_AUTO_MAPPING_OFF:return "AUTO_MAPPING_OFF";
     case BLUETOOTH_CMD_SLAM_NAV_ON:     return "SLAM_NAV_ON";
@@ -770,6 +771,15 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
       (strcmp(line, "ODOM DEBUG OFF") == 0))
   {
     return BLUETOOTH_CMD_ODOM_DEBUG_OFF;
+  }
+
+  if ((strcmp(line, "END ENCODER") == 0) ||
+      (strcmp(line, "ENCODER END") == 0) ||
+      (strcmp(line, "END ODOM") == 0) ||
+      (strcmp(line, "ODOM END") == 0) ||
+      (strcmp(line, "ENCODER CAL END") == 0))
+  {
+    return BLUETOOTH_CMD_ENCODER_CAL_END;
   }
 
   if ((strcmp(line, "96") == 0) ||

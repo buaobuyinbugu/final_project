@@ -61,6 +61,7 @@
 #define MAP_STAT_TX_INTERVAL_MS     2000U
 #define POSE_TX_INTERVAL_MS         100U
 #define LIDAR_DEBUG_MAX_TX_PER_BATCH 4U
+#define LIDAR_FRONT_STATE_MAX_AGE_MS 700U
 #define ODOM_DEBUG_TX_INTERVAL_MS   500U
 #define AUTO_MAPPING_CONTROL_INTERVAL_MS 50U
 #define AUTO_MAPPING_FRONT_SECTOR_CDEG 1800U
@@ -73,6 +74,7 @@
 #define AUTO_MAPPING_DIAGONAL_SECTOR_CDEG 1800U
 #define AUTO_MAPPING_MIN_SAFE_MM    350U
 #define AUTO_MAPPING_MAX_SAFE_MM    3000U
+#define AUTO_MAPPING_FRONT_BLOCK_MAX_MM 900U
 #define AUTO_MAPPING_MAX_DRIVE_PWM  1000U
 #define AUTO_MAPPING_MAX_TURN_PWM   1000U
 #define AUTO_MAPPING_OPEN_MARGIN_MM 180U
@@ -107,7 +109,9 @@
 #define MAPPING_POSE_HISTORY_LENGTH 64U
 #define MAPPING_LIDAR_POINT_MAX_AGE_MS 250U
 #define ENCODER_RIGHT_DELTA_SIGN    (-1L)
-#define MAPPING_ENCODER_MM_PER_COUNT_X1000 133L
+#define MAPPING_ENCODER_MM_PER_COUNT_X1000 94L
+#define ENCODER_CAL_DISTANCE_MM     350L
+#define ENCODER_CAL_MIN_COUNTS      10L
 #define GYRO_STATIONARY_COUNT_THRESHOLD 2L
 #define GYRO_BIAS_STATIONARY_CONFIRM_SAMPLES 25U
 #define GYRO_BIAS_FILTER_DIVISOR    16L
@@ -219,6 +223,7 @@ static uint32_t odom_debug_seq = 0U;
 static int32_t odom_debug_left_counts = 0L;
 static int32_t odom_debug_right_counts = 0L;
 static int32_t odom_debug_heading_cdeg = 0L;
+static int32_t mapping_encoder_mm_per_count_x1000 = MAPPING_ENCODER_MM_PER_COUNT_X1000;
 static int32_t gyro_z_bias_dps_x100 = 0L;
 static int32_t gyro_z_corrected_dps_x100 = 0L;
 static uint8_t gyro_bias_stationary_samples = 0U;
@@ -304,6 +309,7 @@ static void TestApp_RecordPoseHistory(uint32_t tick_ms);
 static bool TestApp_GetPoseForTick(uint32_t tick_ms, MappingGridPose_t *out_pose);
 static void TestApp_StartOdomDebug(void);
 static void TestApp_StopOdomDebug(void);
+static void TestApp_EndEncoderCalibration(void);
 static void TestApp_UpdateGyroDriftCompensation(int16_t left_delta, int16_t right_delta);
 static void TestApp_StartGyroCalibration(void);
 static void TestApp_UpdateGyroCalibration(uint32_t now_ms, int16_t left_delta, int16_t right_delta);
@@ -337,6 +343,7 @@ static void TestApp_SendDirState(void);
 static int32_t AppAbs32(int32_t value);
 static uint16_t ClampPwmPermille(uint16_t value, uint16_t max_value);
 static uint16_t GetObstacleSafeDistanceMm(void);
+static uint16_t GetAutoFrontBlockDistanceMm(void);
 
 static bool OLED_InitMinimal(void);
 static bool OLED_WriteCommand(uint8_t command);
@@ -676,6 +683,15 @@ static uint16_t GetObstacleSafeDistanceMm(void)
   }
 
   return (uint16_t)(AUTO_MAPPING_MIN_SAFE_MM + (((uint32_t)adc_value * span) / 4095U));
+}
+
+static uint16_t GetAutoFrontBlockDistanceMm(void)
+{
+  uint16_t safe_mm = GetObstacleSafeDistanceMm();
+
+  return (safe_mm > AUTO_MAPPING_FRONT_BLOCK_MAX_MM) ?
+      AUTO_MAPPING_FRONT_BLOCK_MAX_MM :
+      safe_mm;
 }
 
 static bool PwmValueChanged(uint16_t current, uint16_t target)
@@ -1121,6 +1137,10 @@ static void TestApp_HandleBluetoothCommands(void)
         TestApp_StopOdomDebug();
         break;
 
+      case BLUETOOTH_CMD_ENCODER_CAL_END:
+        TestApp_EndEncoderCalibration();
+        break;
+
       case BLUETOOTH_CMD_AUTO_MAPPING_ON:
         SlamNav_Stop();
         TestApp_StartAutoMapping();
@@ -1384,13 +1404,13 @@ static void TestApp_SendLidarFrontState(void)
   uint32_t now = HAL_GetTick();
   uint32_t age_ms = 0U;
   uint16_t safe_mm = GetObstacleSafeDistanceMm();
+  uint16_t block_mm = GetAutoFrontBlockDistanceMm();
   bool data_valid;
   bool direct_blocked;
   bool auto_blocked;
   char line[192];
 
-  if ((lidar_front_current.point_count > 0U) &&
-      ((stats.point_count == 0U) || (lidar_front_current.last_tick_ms >= stats.last_tick_ms)))
+  if (lidar_front_current.scan_seq >= stats.scan_seq)
   {
     stats = lidar_front_current;
   }
@@ -1400,14 +1420,16 @@ static void TestApp_SendLidarFrontState(void)
     age_ms = now - stats.min_tick_ms;
   }
 
-  data_valid = ((stats.point_count > 0U) && (stats.min_distance_mm > 0U));
-  direct_blocked = data_valid && (stats.min_distance_mm <= safe_mm);
+  data_valid = ((stats.point_count > 0U) &&
+      (stats.min_distance_mm > 0U) &&
+      (age_ms <= LIDAR_FRONT_STATE_MAX_AGE_MS));
+  direct_blocked = data_valid && (stats.min_distance_mm <= block_mm);
   auto_blocked = TestApp_IsAutoFrontBlocked(now);
 
   (void)snprintf(
       line,
       sizeof(line),
-      "LIDAR FRONT scan=%lu cnt=%u min=%u raw=%u robot=%u q=%u age=%lu safe=%u sector=%u blocked=%u auto=%u\r\n",
+      "LIDAR FRONT scan=%lu cnt=%u min=%u raw=%u robot=%u q=%u age=%lu safe=%u block=%u sector=%u blocked=%u auto=%u\r\n",
       (unsigned long)stats.scan_seq,
       (unsigned int)stats.point_count,
       (unsigned int)stats.min_distance_mm,
@@ -1416,6 +1438,7 @@ static void TestApp_SendLidarFrontState(void)
       (unsigned int)stats.min_quality,
       (unsigned long)age_ms,
       (unsigned int)safe_mm,
+      (unsigned int)block_mm,
       (unsigned int)AUTO_MAPPING_FRONT_SECTOR_CDEG,
       (unsigned int)direct_blocked,
       (unsigned int)auto_blocked);
@@ -1464,7 +1487,7 @@ static void TestApp_UpdateMappingPose(uint32_t now_ms, int16_t left_delta, int16
   if (MotorControl_GetState(&motor_state) && motor_state.forward_active)
   {
     travel_counts = (AppAbs32((int32_t)left_delta) + AppAbs32((int32_t)right_delta)) / 2L;
-    travel_x1000 = (travel_counts * MAPPING_ENCODER_MM_PER_COUNT_X1000) + mapping_travel_residual_x1000;
+    travel_x1000 = (travel_counts * mapping_encoder_mm_per_count_x1000) + mapping_travel_residual_x1000;
     travel_mm = travel_x1000 / 1000L;
     mapping_travel_residual_x1000 = travel_x1000 - (travel_mm * 1000L);
     if (travel_mm != 0L)
@@ -1546,7 +1569,7 @@ static void TestApp_StartOdomDebug(void)
   last_odom_debug_update_tick_ms = now;
   last_odom_debug_tx_tick_ms = 0U;
 
-  (void)BluetoothControl_SendText("ODOM START format=ODOM seq=<n> lc=<left_counts> rc=<right_counts> avg=<counts> dist=<mm> heading=<cdeg> gz=<corrected_dps_x100> gb=<bias_dps_x100> k=<mm_x1000_per_count>\r\n");
+  (void)BluetoothControl_SendText("ODOM START cal_mm=350 push_straight_then_send_END_ENCODER fields=seq,lc,rc,avg,dist,cal_k,heading,gz,gb,k\r\n");
 }
 
 static void TestApp_StopOdomDebug(void)
@@ -1558,6 +1581,58 @@ static void TestApp_StopOdomDebug(void)
 
   odom_debug_active = false;
   (void)BluetoothControl_SendText("ODOM STOP\r\n");
+}
+
+static void TestApp_EndEncoderCalibration(void)
+{
+  char line[192];
+  int32_t abs_left;
+  int32_t abs_right;
+  int32_t average_counts;
+  int32_t new_k_x1000;
+  int32_t old_k_x1000 = mapping_encoder_mm_per_count_x1000;
+
+  if (!odom_debug_active)
+  {
+    (void)BluetoothControl_SendText("ODOM CAL ERR inactive send_94_first\r\n");
+    return;
+  }
+
+  abs_left = AppAbs32(odom_debug_left_counts);
+  abs_right = AppAbs32(odom_debug_right_counts);
+  average_counts = (abs_left + abs_right) / 2L;
+  odom_debug_active = false;
+
+  if (average_counts < ENCODER_CAL_MIN_COUNTS)
+  {
+    (void)snprintf(
+        line,
+        sizeof(line),
+        "ODOM CAL ERR avg=%ld min=%ld lc=%ld rc=%ld k=%ld\r\n",
+        (long)average_counts,
+        (long)ENCODER_CAL_MIN_COUNTS,
+        (long)odom_debug_left_counts,
+        (long)odom_debug_right_counts,
+        (long)old_k_x1000);
+    (void)BluetoothControl_SendText(line);
+    return;
+  }
+
+  new_k_x1000 = (ENCODER_CAL_DISTANCE_MM * 1000L) / average_counts;
+  mapping_encoder_mm_per_count_x1000 = new_k_x1000;
+  mapping_travel_residual_x1000 = 0L;
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "ODOM CAL DONE cal_mm=%ld avg=%ld old_k=%ld new_k=%ld lc=%ld rc=%ld persist=ram\r\n",
+      (long)ENCODER_CAL_DISTANCE_MM,
+      (long)average_counts,
+      (long)old_k_x1000,
+      (long)new_k_x1000,
+      (long)odom_debug_left_counts,
+      (long)odom_debug_right_counts);
+  (void)BluetoothControl_SendText(line);
 }
 
 static void TestApp_UpdateOdomDebug(uint32_t now_ms, int16_t left_delta, int16_t right_delta)
@@ -1596,6 +1671,7 @@ static void TestApp_StreamOdomDebug(void)
   int32_t abs_right;
   int32_t average_counts;
   int32_t distance_mm;
+  int32_t cal_k_x1000 = 0L;
 
   if (!odom_debug_active)
   {
@@ -1611,21 +1687,26 @@ static void TestApp_StreamOdomDebug(void)
   abs_left = AppAbs32(odom_debug_left_counts);
   abs_right = AppAbs32(odom_debug_right_counts);
   average_counts = (abs_left + abs_right) / 2L;
-  distance_mm = (average_counts * MAPPING_ENCODER_MM_PER_COUNT_X1000) / 1000L;
+  distance_mm = (average_counts * mapping_encoder_mm_per_count_x1000) / 1000L;
+  if (average_counts > 0L)
+  {
+    cal_k_x1000 = (ENCODER_CAL_DISTANCE_MM * 1000L) / average_counts;
+  }
 
   (void)snprintf(
       line,
       sizeof(line),
-      "ODOM seq=%lu lc=%ld rc=%ld avg=%ld dist=%ld heading=%ld gz=%ld gb=%ld k=%ld\r\n",
+      "ODOM seq=%lu lc=%ld rc=%ld avg=%ld dist=%ld cal_k=%ld heading=%ld gz=%ld gb=%ld k=%ld\r\n",
       (unsigned long)odom_debug_seq++,
       (long)odom_debug_left_counts,
       (long)odom_debug_right_counts,
       (long)average_counts,
       (long)distance_mm,
+      (long)cal_k_x1000,
       (long)odom_debug_heading_cdeg,
       (long)gyro_z_corrected_dps_x100,
       (long)gyro_z_bias_dps_x100,
-      (long)MAPPING_ENCODER_MM_PER_COUNT_X1000);
+      (long)mapping_encoder_mm_per_count_x1000);
   (void)BluetoothControl_SendText(line);
 }
 
@@ -2001,7 +2082,7 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point)
   }
 
   if (TestApp_IsFrontLidarPoint(robot_angle_cdeg) &&
-      (point->distance_mm <= GetObstacleSafeDistanceMm()))
+      (point->distance_mm <= GetAutoFrontBlockDistanceMm()))
   {
     auto_mapping_front_blocked_until_ms = HAL_GetTick() + AUTO_MAPPING_FRONT_BLOCK_HOLD_MS;
     if (!angle_turn_active)
@@ -2133,7 +2214,7 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
   }
   last_auto_mapping_control_tick_ms = now_ms;
 
-  safe_mm = GetObstacleSafeDistanceMm();
+  safe_mm = GetAutoFrontBlockDistanceMm();
   side_open_mm = (uint16_t)(safe_mm + AUTO_MAPPING_OPEN_MARGIN_MM);
   right_open_mm = (uint16_t)(safe_mm + AUTO_MAPPING_RIGHT_OPEN_MARGIN_MM);
   if (right_open_mm < AUTO_MAPPING_MIN_RIGHT_OPEN_MM)
