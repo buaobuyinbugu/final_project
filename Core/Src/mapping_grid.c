@@ -160,10 +160,8 @@ static bool MappingGrid_InsertPolarPointWithPose(const MappingGridPose_t *pose,
   }
   else if (MappingGrid_FindClippedRayEnd(pose->x_mm, pose->y_mm, hit_world_x_mm, hit_world_y_mm, &hit_x, &hit_y))
   {
+    MappingGrid_TraceFreeRay(robot_x, robot_y, hit_x, hit_y);
     s_stats.clipped_rays++;
-    s_stats.rejected_points++;
-    taskEXIT_CRITICAL();
-    return false;
   }
   else
   {

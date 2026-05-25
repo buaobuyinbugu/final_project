@@ -4,6 +4,7 @@
 
 #define ASTAR_TOTAL_CELLS ((uint16_t)(MAPPING_GRID_WIDTH_CELLS * MAPPING_GRID_HEIGHT_CELLS))
 #define ASTAR_FRONTIER_CANDIDATE_LIMIT 64U
+#define ASTAR_FRONTIER_HEADING_TIE_CELLS 2U
 #define ASTAR_NODE_FLAG_OPEN 0x01U
 #define ASTAR_NODE_FLAG_CLOSED 0x02U
 #define ASTAR_COST_INF 0xFFFFU
@@ -404,6 +405,16 @@ static bool Astar_CandidateBetter(uint8_t preference,
                                   uint8_t other_preference,
                                   uint16_t other_distance)
 {
+  if ((distance + ASTAR_FRONTIER_HEADING_TIE_CELLS) < other_distance)
+  {
+    return true;
+  }
+
+  if ((other_distance + ASTAR_FRONTIER_HEADING_TIE_CELLS) < distance)
+  {
+    return false;
+  }
+
   if (preference != other_preference)
   {
     return preference < other_preference;

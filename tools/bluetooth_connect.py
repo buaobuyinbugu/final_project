@@ -19,7 +19,7 @@ except ImportError as exc:
     raise SystemExit(2) from exc
 
 
-DEFAULT_BAUDRATE = 115200
+DEFAULT_BAUDRATE = 921600
 DEFAULT_READ_SIZE = 256
 BLUETOOTH_KEYWORDS = ("bluetooth", "standard serial over bluetooth", "bth")
 

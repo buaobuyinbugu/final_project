@@ -306,8 +306,7 @@ static bool BluetoothControl_ShouldSendToBluetooth(const uint8_t *data, uint16_t
     return true;
   }
 
-  if (BluetoothControl_HasPrefix(data, length, "LP ") ||
-      BluetoothControl_HasPrefix(data, length, "ODOM "))
+  if (BluetoothControl_HasPrefix(data, length, "ODOM "))
   {
     return false;
   }

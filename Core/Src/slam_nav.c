@@ -21,7 +21,7 @@
 #define SLAM_NAV_DEFAULT_SAFE_MM        350U
 #define SLAM_NAV_MAX_PWM                1000U
 #define SLAM_NAV_MIN_SAFE_MM            350U
-#define SLAM_NAV_LOCAL_CLEARANCE_MM     300U
+#define SLAM_NAV_LOCAL_CLEARANCE_MM     400U
 #define SLAM_NAV_MIN_DRIVE_PWM          380U
 #define SLAM_NAV_MIN_TURN_PWM           380U
 #define SLAM_NAV_FRONT_SECTOR_CDEG      3000U
@@ -258,9 +258,11 @@ void SlamNav_SetControlConfig(uint16_t drive_pwm_permille,
 
 void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
 {
+  uint32_t now;
   uint16_t safe_mm;
   uint16_t local_block_mm;
   uint16_t robot_angle_cdeg;
+  bool force_replan = false;
 
   if ((point == NULL) ||
       !s_active ||
@@ -295,10 +297,24 @@ void SlamNav_ObserveLidarPoint(const LidarPoint_t *point)
   local_block_mm = SlamNav_LocalBlockDistanceMm(safe_mm);
   if (point->distance_mm <= local_block_mm)
   {
+    now = HAL_GetTick();
     taskENTER_CRITICAL();
-    s_front_blocked_until_ms = HAL_GetTick() + SLAM_NAV_FRONT_BLOCK_HOLD_MS;
+    s_front_blocked_until_ms = now + SLAM_NAV_FRONT_BLOCK_HOLD_MS;
     s_front_min_distance_mm = point->distance_mm;
+    if (s_state == SLAM_NAV_STATE_DRIVE)
+    {
+      s_state = SLAM_NAV_STATE_REPLAN;
+      s_state_enter_tick_ms = now;
+      s_replan_after_tick_ms = now + SLAM_NAV_BLOCKED_REPLAN_WAIT_MS;
+      force_replan = true;
+    }
     taskEXIT_CRITICAL();
+
+    if (force_replan)
+    {
+      MotorControl_Stop();
+      SlamNav_SendStatus("REPLAN", "FRONT_LIDAR");
+    }
   }
 }
 
@@ -632,8 +648,21 @@ static void SlamNav_UpdateDrive(void)
   int32_t distance_sq;
   int32_t error_cdeg;
 
+  if (SlamNav_IsFrontBlocked())
+  {
+    uint32_t now = HAL_GetTick();
+
+    MotorControl_Stop();
+    s_state = SLAM_NAV_STATE_REPLAN;
+    s_state_enter_tick_ms = now;
+    s_replan_after_tick_ms = now + SLAM_NAV_BLOCKED_REPLAN_WAIT_MS;
+    SlamNav_SendStatus("REPLAN", "FRONT_BLOCKED");
+    return;
+  }
+
   if (!SlamNav_GetPoseAndCell(&pose, &current_x, &current_y))
   {
+    MotorControl_Stop();
     s_state = SLAM_NAV_STATE_REPLAN;
     s_state_enter_tick_ms = HAL_GetTick();
     return;
@@ -667,6 +696,18 @@ static void SlamNav_UpdateDrive(void)
     MotorControl_Stop();
     s_state = SLAM_NAV_STATE_TURN;
     s_state_enter_tick_ms = HAL_GetTick();
+    return;
+  }
+
+  if (SlamNav_IsFrontBlocked())
+  {
+    uint32_t now = HAL_GetTick();
+
+    MotorControl_Stop();
+    s_state = SLAM_NAV_STATE_REPLAN;
+    s_state_enter_tick_ms = now;
+    s_replan_after_tick_ms = now + SLAM_NAV_BLOCKED_REPLAN_WAIT_MS;
+    SlamNav_SendStatus("REPLAN", "FRONT_BLOCKED");
     return;
   }
 
@@ -787,14 +828,14 @@ static uint16_t SlamNav_ClampPwm(uint16_t value)
 
 static uint16_t SlamNav_LocalBlockDistanceMm(uint16_t configured_safe_mm)
 {
-  uint16_t local_limit_mm = (uint16_t)(MAPPING_GRID_CELL_SIZE_MM + SLAM_NAV_LOCAL_CLEARANCE_MM);
+  uint16_t local_min_mm = (uint16_t)(MAPPING_GRID_CELL_SIZE_MM + SLAM_NAV_LOCAL_CLEARANCE_MM);
 
   if (configured_safe_mm < SLAM_NAV_MIN_SAFE_MM)
   {
     configured_safe_mm = SLAM_NAV_MIN_SAFE_MM;
   }
 
-  return (configured_safe_mm > local_limit_mm) ? local_limit_mm : configured_safe_mm;
+  return (configured_safe_mm < local_min_mm) ? local_min_mm : configured_safe_mm;
 }
 
 static void SlamNav_ResetSectorStats(SlamNavSectorStats_t *stats)
@@ -1032,6 +1073,7 @@ static void SlamNav_SendHeartbeatIfDue(void)
   uint32_t revision = MappingGrid_GetRevision();
   uint16_t configured_safe_mm;
   uint16_t local_block_mm;
+  uint16_t front_sector_mm;
   SlamNavSectorStats_t sectors;
   MappingGridPose_t pose;
   uint8_t cell_x = 0U;
@@ -1049,12 +1091,13 @@ static void SlamNav_SendHeartbeatIfDue(void)
   taskEXIT_CRITICAL();
   local_block_mm = SlamNav_LocalBlockDistanceMm(configured_safe_mm);
   sectors = SlamNav_GetSectorSnapshot(now);
+  front_sector_mm = (sectors.front_mm == UINT16_MAX) ? 0U : sectors.front_mm;
 
   pose_ok = SlamNav_GetPoseAndCell(&pose, &cell_x, &cell_y);
   (void)snprintf(
       line,
       sizeof(line),
-      "SLAM HB state=%s seq=%lu cell=%u,%u target=%u,%u path_i=%u path_len=%u front=%u rev=%lu safe=%u adc_safe=%u sec=%u,%u,%u,%u pose=%ld,%ld,%ld ok=%u\r\n",
+      "SLAM HB state=%s seq=%lu cell=%u,%u target=%u,%u path_i=%u path_len=%u front=%u rev=%lu safe=%u adc_safe=%u block_front=%u sec=%u,%u,%u,%u pose=%ld,%ld,%ld ok=%u\r\n",
       SlamNav_StateName(s_state),
       (unsigned long)s_plan_seq,
       (unsigned int)cell_x,
@@ -1063,10 +1106,11 @@ static void SlamNav_SendHeartbeatIfDue(void)
       (unsigned int)s_current_target_cell.y,
       (unsigned int)s_path_index,
       (unsigned int)s_path.length,
-      (unsigned int)s_front_min_distance_mm,
+      (unsigned int)front_sector_mm,
       (unsigned long)revision,
       (unsigned int)local_block_mm,
       (unsigned int)configured_safe_mm,
+      (unsigned int)s_front_min_distance_mm,
       (unsigned int)sectors.front_mm,
       (unsigned int)sectors.right_mm,
       (unsigned int)sectors.left_mm,

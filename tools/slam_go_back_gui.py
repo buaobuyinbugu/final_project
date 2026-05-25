@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover
 
 
 DEFAULT_PORT = "COM3"
-DEFAULT_BAUD = 115200
+DEFAULT_BAUD = 921600
 LOG_LIMIT = 500
 BLUETOOTH_KEYWORDS = ("bluetooth", "standard serial over bluetooth", "bth", "spp")
 
@@ -181,6 +181,7 @@ class GoBackGui(tk.Tk):
         controls.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 8))
         ttk.Button(controls, text="Go", command=lambda: self._send("SLAM")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
         ttk.Button(controls, text="Back", command=lambda: self._send("BACK")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
+        ttk.Button(controls, text="0 Brake", command=lambda: self._send("0")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
         ttk.Button(controls, text="Stop", command=lambda: self._send("SLAM OFF")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
         ttk.Button(controls, text="96 Wall", command=lambda: self._send("96")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
         ttk.Button(controls, text="Gyro Cal", command=lambda: self._send("GYRO CAL")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)

@@ -12,13 +12,13 @@ import serial
 
 
 PORT = "COM6"
-BAUDRATE = 115200
+BAUDRATE = 921600
 CANVAS_PX = 720
 MAX_RANGE_MM = 8000
 MAX_POINTS = 1200
 
 POINT_RE = re.compile(
-    r"^LP\s+seq=(?P<seq>\d+)\s+a=(?P<angle>\d+)\s+d=(?P<dist>\d+)\s+"
+    r"^LP\s+seq=(?P<seq>\d+)\s+a=(?P<angle>\d+)(?:\s+r=(?P<robot_angle>\d+))?\s+d=(?P<dist>\d+)\s+"
     r"q=(?P<quality>\d+)\s+s=(?P<start>[01])"
 )
 
@@ -27,6 +27,7 @@ POINT_RE = re.compile(
 class LidarPoint:
     seq: int
     angle_cdeg: int
+    robot_angle_cdeg: int
     distance_mm: int
     quality: int
     scan_start: bool
@@ -73,6 +74,9 @@ class LidarDebugViewer:
         )
         ttk.Button(root, text="Clear", command=self.clear_points).grid(
             row=3, column=2, padx=4, pady=(0, 10), sticky="ew"
+        )
+        ttk.Button(root, text="0 Brake", command=lambda: self.send_command("0")).grid(
+            row=3, column=3, padx=4, pady=(0, 10), sticky="ew"
         )
         ttk.Button(root, text="Close", command=self.close).grid(
             row=3, column=4, padx=(4, 10), pady=(0, 10), sticky="ew"
@@ -137,7 +141,7 @@ class LidarDebugViewer:
             if point.distance_mm <= 0 or point.distance_mm > self.max_range_mm:
                 continue
 
-            angle_rad = math.radians(point.angle_cdeg / 100.0)
+            angle_rad = math.radians(point.robot_angle_cdeg / 100.0)
             r = (point.distance_mm / float(self.max_range_mm)) * radius
             x = center + math.cos(angle_rad) * r
             y = center - math.sin(angle_rad) * r
@@ -181,6 +185,7 @@ class LidarDebugViewer:
             last = self.points[-1]
             text += (
                 f" last: seq={last.seq} angle={last.angle_cdeg / 100.0:.2f}deg "
+                f"robot={last.robot_angle_cdeg / 100.0:.2f}deg "
                 f"dist={last.distance_mm}mm q={last.quality} start={int(last.scan_start)}"
             )
         elif self.last_line:
@@ -204,6 +209,7 @@ def parse_point(line):
     return LidarPoint(
         seq=int(match.group("seq")),
         angle_cdeg=int(match.group("angle")),
+        robot_angle_cdeg=int(match.group("robot_angle") or match.group("angle")),
         distance_mm=int(match.group("dist")),
         quality=int(match.group("quality")),
         scan_start=(match.group("start") == "1"),

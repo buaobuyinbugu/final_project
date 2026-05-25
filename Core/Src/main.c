@@ -55,7 +55,7 @@
 #define ADC_PWM_MAX_PERMILLE        1000U
 #define ADC_PWM_UPDATE_DEADBAND     8U
 
-#define MAPPING_POINT_BATCH_LIMIT   6U
+#define MAPPING_POINT_BATCH_LIMIT   64U
 #define MAP_ROW_TX_INTERVAL_MS      30U
 #define MAP_ROWS_PER_TX_BURST       2U
 #define MAP_STAT_TX_INTERVAL_MS     2000U
@@ -66,6 +66,7 @@
 #define AUTO_MAPPING_FRONT_SECTOR_CDEG 1800U
 #define AUTO_MAPPING_SIDE_SECTOR_CDEG  3000U
 #define AUTO_MAPPING_RIGHT_CENTER_CDEG 9000U
+#define AUTO_MAPPING_BACK_CENTER_CDEG 18000U
 #define AUTO_MAPPING_LEFT_CENTER_CDEG  27000U
 #define AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG 4500U
 #define AUTO_MAPPING_FRONT_LEFT_CENTER_CDEG 31500U
@@ -83,6 +84,8 @@
 #define AUTO_MAPPING_OBSERVE_SCAN_STARTS 3U
 #define AUTO_MAPPING_OBSERVE_TIMEOUT_MS 700U
 #define AUTO_MAPPING_FRONT_BLOCK_HOLD_MS 400U
+#define AUTO_MAPPING_GRID_TURN_DEG  90U
+#define AUTO_MAPPING_U_TURN_DEG     180U
 #define AUTO_MAPPING_MIN_TURN_DEG   40U
 #define AUTO_MAPPING_MAX_TURN_DEG   180U
 #define AUTO_MAPPING_TURN_SETTLE_MS 240U
@@ -270,13 +273,13 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
-static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_I2C2_Init(void);
+static void MX_USART2_UART_Init(void);
 static void MX_USART6_UART_Init(void);
 void StartDefaultTask(void const * argument);
 
@@ -315,10 +318,6 @@ static void TestApp_UpdateAutoMappingObstacle(const LidarPoint_t *point);
 static void TestApp_StartAutoObservation(const char *reason);
 static void TestApp_ResetAutoMappingSectorMins(void);
 static bool TestApp_IsAutoFrontBlocked(uint32_t now_ms);
-static uint16_t TestApp_ClampAutoTurnDegrees(uint16_t degrees);
-static uint16_t TestApp_GetTurnDegreesFromLidarAngle(uint16_t target_angle_cdeg, int8_t *out_direction);
-static uint16_t TestApp_GetAutoRightTurnDegrees(void);
-static uint16_t TestApp_GetAutoEscapeTurnDegrees(int8_t *out_direction);
 static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, const char *reason, uint32_t now_ms);
 static void TestApp_StartAngleTurn(int8_t direction, uint16_t degrees);
 static void TestApp_StartHeadingTurn(int32_t target_heading_cdeg, uint8_t correction_count, const char *reason);
@@ -1277,6 +1276,13 @@ static void TestApp_ProcessLidarPoints(void)
     bool point_is_fresh = ((int32_t)(point.tick_count - mapping_start_tick_ms) >= 0L) &&
         ((now_ms - point.tick_count) <= MAPPING_LIDAR_POINT_MAX_AGE_MS);
 
+    if (point_is_fresh)
+    {
+      TestApp_UpdateLidarFrontStats(&point);
+      TestApp_UpdateAutoMappingObstacle(&point);
+      SlamNav_ObserveLidarPoint(&point);
+    }
+
     if (mapping_active)
     {
       if (point_is_fresh && TestApp_GetPoseForTick(point.tick_count, &point_pose))
@@ -1287,13 +1293,6 @@ static void TestApp_ProcessLidarPoints(void)
       {
         (void)MappingGrid_InsertPolarPoint(point.angle_cdeg, point.distance_mm, point.quality);
       }
-    }
-
-    if (point_is_fresh)
-    {
-      TestApp_UpdateLidarFrontStats(&point);
-      TestApp_UpdateAutoMappingObstacle(&point);
-      SlamNav_ObserveLidarPoint(&point);
     }
 
     if (lidar_debug_active &&
@@ -2079,7 +2078,6 @@ static void TestApp_StartAutoObservation(const char *reason)
 static void TestApp_UpdateAutoMapping(uint32_t now_ms)
 {
   MotorControlState_t motor_state = {0};
-  int8_t turn_direction;
   uint16_t safe_mm;
   uint16_t side_open_mm;
   uint16_t right_open_mm;
@@ -2088,10 +2086,13 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
   uint16_t drive_pwm;
   bool front_open;
   bool front_blocked;
+  bool right_seen;
+  bool front_right_seen;
+  bool left_seen;
   bool right_open;
   bool front_right_open;
   bool left_open;
-  bool right_branch_candidate;
+  bool right_turn_candidate;
 
   if (!auto_mapping_active)
   {
@@ -2148,24 +2149,25 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
   front_blocked = TestApp_IsAutoFrontBlocked(now_ms);
   front_open = !front_blocked &&
       ((auto_mapping_front_min_mm == UINT16_MAX) || (auto_mapping_front_min_mm > safe_mm));
-  right_open = (auto_mapping_right_min_mm == UINT16_MAX) || (auto_mapping_right_min_mm > right_open_mm);
-  front_right_open = (auto_mapping_front_right_min_mm == UINT16_MAX) ||
-      (auto_mapping_front_right_min_mm > front_right_open_mm);
-  left_open = (auto_mapping_left_min_mm == UINT16_MAX) || (auto_mapping_left_min_mm > side_open_mm);
+  right_seen = (auto_mapping_right_min_mm != UINT16_MAX);
+  front_right_seen = (auto_mapping_front_right_min_mm != UINT16_MAX);
+  left_seen = (auto_mapping_left_min_mm != UINT16_MAX);
+  right_open = right_seen && (auto_mapping_right_min_mm > right_open_mm);
+  front_right_open = front_right_seen && (auto_mapping_front_right_min_mm > front_right_open_mm);
+  left_open = left_seen && (auto_mapping_left_min_mm > side_open_mm);
 
-  if ((auto_mapping_right_min_mm != UINT16_MAX) && (auto_mapping_right_min_mm <= right_wall_seen_mm))
+  if (right_seen && (auto_mapping_right_min_mm <= right_wall_seen_mm))
   {
     auto_mapping_right_wall_seen = true;
     auto_mapping_right_branch_confirm_count = 0U;
   }
 
-  right_branch_candidate = front_open &&
-      right_open &&
+  right_turn_candidate = right_open &&
       front_right_open &&
-      auto_mapping_right_wall_seen &&
+      (front_blocked || (front_open && auto_mapping_right_wall_seen)) &&
       ((int32_t)(now_ms - auto_mapping_ignore_right_until_ms) >= 0L);
 
-  if (right_branch_candidate)
+  if (right_turn_candidate)
   {
     if (auto_mapping_right_branch_confirm_count < AUTO_MAPPING_RIGHT_BRANCH_CONFIRM_COUNT)
     {
@@ -2177,28 +2179,13 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
     auto_mapping_right_branch_confirm_count = 0U;
   }
 
-  if (right_branch_candidate &&
+  if (right_turn_candidate &&
       (auto_mapping_right_branch_confirm_count >= AUTO_MAPPING_RIGHT_BRANCH_CONFIRM_COUNT))
   {
     MotorControl_Stop();
-    TestApp_AutoMappingStartTurn(1, TestApp_GetAutoRightTurnDegrees(), "RIGHT_OPEN", now_ms);
+    TestApp_AutoMappingStartTurn(1, AUTO_MAPPING_GRID_TURN_DEG, "RIGHT_OPEN", now_ms);
   }
-  else if (!front_open && left_open)
-  {
-    uint16_t left_target_angle_cdeg = (auto_mapping_left_best_distance_mm > 0U) ?
-        auto_mapping_left_best_angle_cdeg :
-        AUTO_MAPPING_LEFT_CENTER_CDEG;
-    uint16_t turn_degrees = TestApp_GetTurnDegreesFromLidarAngle(left_target_angle_cdeg, &turn_direction);
-    MotorControl_Stop();
-    TestApp_AutoMappingStartTurn(turn_direction, turn_degrees, "LEFT_OPEN", now_ms);
-  }
-  else if (!front_open)
-  {
-    uint16_t turn_degrees = TestApp_GetAutoEscapeTurnDegrees(&turn_direction);
-    MotorControl_Stop();
-    TestApp_AutoMappingStartTurn(turn_direction, turn_degrees, left_open ? "FRONT_BLOCKED" : "DEAD_END", now_ms);
-  }
-  else
+  else if (front_open)
   {
     drive_pwm = ClampPwmPermille(GetDrivePwmPermille(), AUTO_MAPPING_MAX_DRIVE_PWM);
     if (!MotorControl_GetState(&motor_state) ||
@@ -2207,6 +2194,16 @@ static void TestApp_UpdateAutoMapping(uint32_t now_ms)
     {
       MotorControl_SetForward(drive_pwm);
     }
+  }
+  else if (left_open)
+  {
+    MotorControl_Stop();
+    TestApp_AutoMappingStartTurn(-1, AUTO_MAPPING_GRID_TURN_DEG, "LEFT_OPEN", now_ms);
+  }
+  else
+  {
+    MotorControl_Stop();
+    TestApp_AutoMappingStartTurn(1, AUTO_MAPPING_U_TURN_DEG, "DEAD_END", now_ms);
   }
 
   TestApp_ResetAutoMappingSectorMins();
@@ -2231,93 +2228,6 @@ static bool TestApp_IsAutoFrontBlocked(uint32_t now_ms)
 {
   return ((auto_mapping_front_blocked_until_ms != 0U) &&
           ((int32_t)(now_ms - auto_mapping_front_blocked_until_ms) < 0L));
-}
-
-static uint16_t TestApp_ClampAutoTurnDegrees(uint16_t degrees)
-{
-  if (degrees < AUTO_MAPPING_MIN_TURN_DEG)
-  {
-    return AUTO_MAPPING_MIN_TURN_DEG;
-  }
-
-  if (degrees > AUTO_MAPPING_MAX_TURN_DEG)
-  {
-    return AUTO_MAPPING_MAX_TURN_DEG;
-  }
-
-  return degrees;
-}
-
-static uint16_t TestApp_GetTurnDegreesFromLidarAngle(uint16_t target_angle_cdeg, int8_t *out_direction)
-{
-  uint16_t normalized_angle_cdeg = (uint16_t)(target_angle_cdeg % 36000U);
-  uint16_t degrees;
-
-  auto_mapping_last_turn_target_angle_cdeg = normalized_angle_cdeg;
-
-  if (normalized_angle_cdeg <= 18000U)
-  {
-    if (out_direction != NULL)
-    {
-      *out_direction = -1;
-    }
-    degrees = (uint16_t)(((uint32_t)normalized_angle_cdeg + 50U) / 100U);
-  }
-  else
-  {
-    if (out_direction != NULL)
-    {
-      *out_direction = 1;
-    }
-    degrees = (uint16_t)((((uint32_t)(36000U - normalized_angle_cdeg)) + 50U) / 100U);
-  }
-
-  return TestApp_ClampAutoTurnDegrees(degrees);
-}
-
-static uint16_t TestApp_GetAutoRightTurnDegrees(void)
-{
-  int8_t direction;
-
-  if (auto_mapping_right_best_distance_mm == 0U)
-  {
-    if ((auto_mapping_escape_best_distance_mm > 0U) && (auto_mapping_escape_best_angle_cdeg >= 18000U))
-    {
-      return TestApp_GetTurnDegreesFromLidarAngle(auto_mapping_escape_best_angle_cdeg, &direction);
-    }
-
-    return TestApp_GetTurnDegreesFromLidarAngle(AUTO_MAPPING_FRONT_RIGHT_CENTER_CDEG, &direction);
-  }
-
-  return TestApp_GetTurnDegreesFromLidarAngle(auto_mapping_right_best_angle_cdeg, &direction);
-}
-
-static uint16_t TestApp_GetAutoEscapeTurnDegrees(int8_t *out_direction)
-{
-  uint16_t target_angle_cdeg = auto_mapping_escape_best_angle_cdeg;
-
-  if (out_direction == NULL)
-  {
-    return AUTO_MAPPING_MIN_TURN_DEG;
-  }
-
-  if ((auto_mapping_left_best_distance_mm > 0U) || (auto_mapping_right_best_distance_mm > 0U))
-  {
-    if (auto_mapping_right_best_distance_mm > auto_mapping_left_best_distance_mm)
-    {
-      target_angle_cdeg = auto_mapping_right_best_angle_cdeg;
-    }
-    else
-    {
-      target_angle_cdeg = auto_mapping_left_best_angle_cdeg;
-    }
-  }
-  else if (auto_mapping_escape_best_distance_mm == 0U)
-  {
-    target_angle_cdeg = (uint16_t)((auto_mapping_front_blocking_angle_cdeg + 18000U) % 36000U);
-  }
-
-  return TestApp_GetTurnDegreesFromLidarAngle(target_angle_cdeg, out_direction);
 }
 
 static int32_t TestApp_SignedHeadingErrorCdeg(int32_t target_cdeg, int32_t current_cdeg)
@@ -2363,7 +2273,7 @@ static int32_t TestApp_GetAutoTurnTargetHeading(int8_t direction, uint16_t reque
 
 static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, const char *reason, uint32_t now_ms)
 {
-  char line[160];
+  char line[224];
   int32_t target_heading_cdeg;
   int32_t snapped_error_cdeg;
   uint16_t snapped_degrees;
@@ -2373,6 +2283,17 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
   auto_mapping_ignore_right_until_ms = auto_mapping_resume_tick_ms + AUTO_MAPPING_POST_TURN_DRIVE_MS;
   auto_mapping_right_branch_confirm_count = 0U;
   auto_mapping_right_wall_seen = false;
+  if (degrees >= 135U)
+  {
+    degrees = AUTO_MAPPING_U_TURN_DEG;
+    auto_mapping_last_turn_target_angle_cdeg = AUTO_MAPPING_BACK_CENTER_CDEG;
+  }
+  else
+  {
+    degrees = AUTO_MAPPING_GRID_TURN_DEG;
+    auto_mapping_last_turn_target_angle_cdeg =
+        (direction < 0) ? AUTO_MAPPING_LEFT_CENTER_CDEG : AUTO_MAPPING_RIGHT_CENTER_CDEG;
+  }
   target_heading_cdeg = TestApp_GetAutoTurnTargetHeading(direction, degrees);
   snapped_error_cdeg = TestApp_SignedHeadingErrorCdeg(target_heading_cdeg, mapping_pose.heading_cdeg);
   snapped_degrees = (uint16_t)((AppAbs32(snapped_error_cdeg) + 50L) / 100L);
@@ -2386,7 +2307,7 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
   (void)snprintf(
       line,
       sizeof(line),
-      "AUTO WALL %s dir=%c req=%u snap=%u head=%ld target=%u front=%u fraw=%u fang=%u right=%u left=%u count=%lu\r\n",
+      "AUTO WALL %s dir=%c req=%u snap=%u head=%ld target=%u front=%u fraw=%u fang=%u right=%u fr=%u left=%u wall=%u conf=%u count=%lu\r\n",
       reason,
       (direction < 0) ? 'L' : 'R',
       (unsigned int)degrees,
@@ -2397,7 +2318,10 @@ static void TestApp_AutoMappingStartTurn(int8_t direction, uint16_t degrees, con
       (unsigned int)auto_mapping_front_last_raw_angle_cdeg,
       (unsigned int)auto_mapping_front_last_robot_angle_cdeg,
       (unsigned int)auto_mapping_right_min_mm,
+      (unsigned int)auto_mapping_front_right_min_mm,
       (unsigned int)auto_mapping_left_min_mm,
+      (unsigned int)auto_mapping_right_wall_seen,
+      (unsigned int)auto_mapping_right_branch_confirm_count,
       (unsigned long)auto_mapping_avoid_count);
   (void)BluetoothControl_SendText(line);
 }
@@ -2661,13 +2585,13 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART1_UART_Init();
-  MX_USART2_UART_Init();
   MX_ADC1_Init();
   MX_I2C1_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
   MX_I2C2_Init();
+  MX_USART2_UART_Init();
   MX_USART6_UART_Init();
   /* USER CODE BEGIN 2 */
   TestApp_InitPeripherals();
@@ -2705,7 +2629,7 @@ int main(void)
   osThreadDef(btTask, StartBtTask, osPriorityHigh, 0, 384);
   btTaskHandle = osThreadCreate(osThread(btTask), NULL);
 
-  osThreadDef(lidarAppTask, StartLidarAppTask, osPriorityBelowNormal, 0, 384);
+  osThreadDef(lidarAppTask, StartLidarAppTask, osPriorityAboveNormal, 0, 384);
   lidarAppTaskHandle = osThreadCreate(osThread(lidarAppTask), NULL);
   /* USER CODE END RTOS_THREADS */
 
@@ -3166,7 +3090,7 @@ static void MX_USART6_UART_Init(void)
 
   /* USER CODE END USART6_Init 1 */
   huart6.Instance = USART6;
-  huart6.Init.BaudRate = 115200;
+  huart6.Init.BaudRate = 921600;
   huart6.Init.WordLength = UART_WORDLENGTH_8B;
   huart6.Init.StopBits = UART_STOPBITS_1;
   huart6.Init.Parity = UART_PARITY_NONE;
@@ -3288,7 +3212,7 @@ void StartSenseTask(void const * argument)
       MotorControl_UpdateButtons();
       TestApp_UpdateSensors();
     }
-    osDelay(5);
+    osDelay(2);
   }
   /* USER CODE END StartSenseTask */
 }

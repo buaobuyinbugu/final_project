@@ -6,7 +6,7 @@ import serial
 
 
 PORT = "COM6"
-BAUDRATE = 115200
+BAUDRATE = 921600
 START_ODOM_ON_OPEN = True
 
 ODOM_RE = re.compile(

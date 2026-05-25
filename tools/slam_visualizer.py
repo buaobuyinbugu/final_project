@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - live serial is optional for replay mod
     list_ports = None
 
 
-DEFAULT_BAUD = 115200
+DEFAULT_BAUD = 921600
 GRID_W = 80
 GRID_H = 80
 CELL_MM = 50
@@ -397,6 +397,7 @@ class SlamVisualizer(tk.Tk):
         ttk.Button(toolbar, text="Replay Log", command=self._choose_replay).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="SLAM", command=self._start_slam).pack(side=tk.LEFT, padx=(16, 2))
         ttk.Button(toolbar, text="Back", command=lambda: self.worker.write_line("BACK")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="0 Brake", command=lambda: self.worker.write_line("0")).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Gyro Cal", command=lambda: self.worker.write_line("GYRO CAL")).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Stop", command=lambda: self.worker.write_line("SLAM OFF")).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Show Map", command=lambda: self.worker.write_line("SHOW MAP")).pack(side=tk.LEFT, padx=2)
