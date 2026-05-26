@@ -5,6 +5,9 @@
 #define ASTAR_TOTAL_CELLS ((uint16_t)(MAPPING_GRID_WIDTH_CELLS * MAPPING_GRID_HEIGHT_CELLS))
 #define ASTAR_FRONTIER_CANDIDATE_LIMIT 64U
 #define ASTAR_FRONTIER_HEADING_TIE_CELLS 2U
+#define ASTAR_FRONTIER_NO_BIAS 0xFFU
+#define ASTAR_OBSTACLE_INFLATION_CELLS 0
+#define ASTAR_FREE_STEP_COST 1U
 #define ASTAR_NODE_FLAG_OPEN 0x01U
 #define ASTAR_NODE_FLAG_CLOSED 0x02U
 #define ASTAR_COST_INF 0xFFFFU
@@ -26,6 +29,7 @@ static void Astar_Cell(uint16_t index, uint8_t *out_x, uint8_t *out_y);
 static uint16_t Astar_Manhattan(uint8_t ax, uint8_t ay, uint8_t bx, uint8_t by);
 static bool Astar_IsInside(int16_t x, int16_t y);
 static bool Astar_IsFree(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8_t y);
+static bool Astar_IsSearchPassable(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8_t y);
 static bool Astar_IsInflatedPassable(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8_t y);
 static bool Astar_IsFrontierCandidate(const MappingGridSnapshot_t *snapshot,
                                       uint8_t start_x,
@@ -181,7 +185,7 @@ AstarPlannerStatus_t AstarPlanner_PlanToGoal(const MappingGridSnapshot_t *snapsh
 
   if ((goal_x >= MAPPING_GRID_WIDTH_CELLS) ||
       (goal_y >= MAPPING_GRID_HEIGHT_CELLS) ||
-      !Astar_IsFree(snapshot, goal_x, goal_y))
+      !Astar_IsSearchPassable(snapshot, goal_x, goal_y))
   {
     out_path->status = ASTAR_PLANNER_STATUS_NO_PATH;
     return out_path->status;
@@ -253,19 +257,34 @@ static bool Astar_IsFree(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8
   return snapshot->cells[y][x] == MAPPING_GRID_CELL_FREE;
 }
 
+static bool Astar_IsSearchPassable(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8_t y)
+{
+  if ((snapshot == NULL) ||
+      (x >= MAPPING_GRID_WIDTH_CELLS) ||
+      (y >= MAPPING_GRID_HEIGHT_CELLS))
+  {
+    return false;
+  }
+
+  return snapshot->cells[y][x] == MAPPING_GRID_CELL_FREE;
+}
+
 static bool Astar_IsInflatedPassable(const MappingGridSnapshot_t *snapshot, uint8_t x, uint8_t y)
 {
+#if ASTAR_OBSTACLE_INFLATION_CELLS > 0
   int16_t dx;
   int16_t dy;
+#endif
 
   if (!Astar_IsFree(snapshot, x, y))
   {
     return false;
   }
 
-  for (dy = -1; dy <= 1; ++dy)
+#if ASTAR_OBSTACLE_INFLATION_CELLS > 0
+  for (dy = -ASTAR_OBSTACLE_INFLATION_CELLS; dy <= ASTAR_OBSTACLE_INFLATION_CELLS; ++dy)
   {
-    for (dx = -1; dx <= 1; ++dx)
+    for (dx = -ASTAR_OBSTACLE_INFLATION_CELLS; dx <= ASTAR_OBSTACLE_INFLATION_CELLS; ++dx)
     {
       int16_t nx = (int16_t)x + dx;
       int16_t ny = (int16_t)y + dy;
@@ -281,6 +300,7 @@ static bool Astar_IsInflatedPassable(const MappingGridSnapshot_t *snapshot, uint
       }
     }
   }
+#endif
 
   return true;
 }
@@ -368,7 +388,7 @@ static uint8_t Astar_CandidatePreference(uint8_t start_x,
 
   if ((preferred_headings_cdeg == NULL) || (preferred_heading_count == 0U))
   {
-    return 0U;
+    return ASTAR_FRONTIER_NO_BIAS;
   }
 
   heading_cdeg = Astar_CandidateHeadingCdeg(start_x, start_y, goal_x, goal_y);
@@ -405,6 +425,15 @@ static bool Astar_CandidateBetter(uint8_t preference,
                                   uint8_t other_preference,
                                   uint16_t other_distance)
 {
+  if ((preference != ASTAR_FRONTIER_NO_BIAS) ||
+      (other_preference != ASTAR_FRONTIER_NO_BIAS))
+  {
+    if (preference != other_preference)
+    {
+      return preference < other_preference;
+    }
+  }
+
   if ((distance + ASTAR_FRONTIER_HEADING_TIE_CELLS) < other_distance)
   {
     return true;
@@ -532,13 +561,12 @@ static AstarPlannerStatus_t Astar_SearchToGoal(const MappingGridSnapshot_t *snap
         continue;
       }
 
-      if ((neighbor != goal_index) &&
-          !Astar_IsInflatedPassable(snapshot, (uint8_t)nx, (uint8_t)ny))
+      if (!Astar_IsSearchPassable(snapshot, (uint8_t)nx, (uint8_t)ny))
       {
         continue;
       }
 
-      tentative_g = (uint16_t)(s_g_score[current] + 1U);
+      tentative_g = (uint16_t)(s_g_score[current] + ASTAR_FREE_STEP_COST);
       if (((s_node_flags[neighbor] & ASTAR_NODE_FLAG_OPEN) == 0U) ||
           (tentative_g < s_g_score[neighbor]))
       {

@@ -6,7 +6,7 @@
 
 #include "mapping_grid.h"
 
-#define ASTAR_PLANNER_MAX_PATH_CELLS 192U
+#define ASTAR_PLANNER_MAX_PATH_CELLS 512U
 
 typedef struct
 {

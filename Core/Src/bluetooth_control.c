@@ -366,6 +366,7 @@ static bool BluetoothControl_IsPriorityTxLine(const char *text)
          (strncmp(text, "GYRO CAL", 8U) == 0) ||
          (strncmp(text, "MPU STATE", 9U) == 0) ||
          (strncmp(text, "DIR ", 4U) == 0) ||
+         (strncmp(text, "LIDAR QUALITY", 13U) == 0) ||
          (strncmp(text, "LIDAR FRONT", 11U) == 0);
 }
 
@@ -426,6 +427,7 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_DEBUG_OFF:       return "DEBUG_OFF";
     case BLUETOOTH_CMD_LIDAR_DEBUG_ON:  return "LIDAR_DEBUG_ON";
     case BLUETOOTH_CMD_LIDAR_DEBUG_OFF: return "LIDAR_DEBUG_OFF";
+    case BLUETOOTH_CMD_LIDAR_QUALITY_SET:return "LIDAR_QUALITY_SET";
     case BLUETOOTH_CMD_ODOM_DEBUG_ON:   return "ODOM_DEBUG_ON";
     case BLUETOOTH_CMD_ODOM_DEBUG_OFF:  return "ODOM_DEBUG_OFF";
     case BLUETOOTH_CMD_ENCODER_CAL_END: return "ENCODER_CAL_END";
@@ -437,6 +439,7 @@ const char *BluetoothControl_CommandName(BluetoothCommandType_t command)
     case BLUETOOTH_CMD_GYRO_CALIBRATE:  return "GYRO_CALIBRATE";
     case BLUETOOTH_CMD_MPU_STATE:       return "MPU_STATE";
     case BLUETOOTH_CMD_LIDAR_FRONT_STATE:return "LIDAR_FRONT_STATE";
+    case BLUETOOTH_CMD_DIR_RESET:       return "DIR_RESET";
     case BLUETOOTH_CMD_DIR_STATE:       return "DIR_STATE";
     case BLUETOOTH_CMD_TURN_LEFT_DEG:   return "TURN_LEFT_DEG";
     case BLUETOOTH_CMD_TURN_RIGHT_DEG:  return "TURN_RIGHT_DEG";
@@ -757,6 +760,14 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
     return BLUETOOTH_CMD_LIDAR_DEBUG_OFF;
   }
 
+  if ((strncmp(line, "LIDAR QUALITY", 13U) == 0) ||
+      (strncmp(line, "LIDAR Q", 7U) == 0) ||
+      (strncmp(line, "QUALITY", 7U) == 0) ||
+      (strncmp(line, "Q ", 2U) == 0))
+  {
+    return BLUETOOTH_CMD_LIDAR_QUALITY_SET;
+  }
+
   if ((strcmp(line, "94") == 0) ||
       (strcmp(line, "ODOM") == 0) ||
       (strcmp(line, "ODOM ON") == 0) ||
@@ -848,6 +859,19 @@ static BluetoothCommandType_t BluetoothControl_ParseLine(const char *line)
       (strcmp(line, "GYRO STATE") == 0))
   {
     return BLUETOOTH_CMD_MPU_STATE;
+  }
+
+  if ((strcmp(line, "RESET FRONT") == 0) ||
+      (strcmp(line, "FRONT RESET") == 0) ||
+      (strcmp(line, "DIR RESET") == 0) ||
+      (strcmp(line, "RESET DIR") == 0) ||
+      (strcmp(line, "HEADING RESET") == 0) ||
+      (strcmp(line, "RESET HEADING") == 0) ||
+      (strcmp(line, "MPU RESET FRONT") == 0) ||
+      (strcmp(line, "MAP NORTH RESET") == 0) ||
+      (strcmp(line, "RESET NORTH") == 0))
+  {
+    return BLUETOOTH_CMD_DIR_RESET;
   }
 
   if ((strcmp(line, "FRONT") == 0) ||

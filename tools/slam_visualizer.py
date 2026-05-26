@@ -31,9 +31,9 @@ except ImportError:  # pragma: no cover - live serial is optional for replay mod
 
 
 DEFAULT_BAUD = 921600
-GRID_W = 80
-GRID_H = 80
-CELL_MM = 50
+GRID_W = 40
+GRID_H = 40
+CELL_MM = 175
 CANVAS_SIZE = 720
 LOG_LIMIT = 300
 LOG_SUPPRESSED_PREFIXES = ("MAP ROW ",)
@@ -131,6 +131,8 @@ class Model:
     unknown_cells: int = GRID_W * GRID_H
     tx_drops: int = 0
     inserted_points: int = 0
+    lidar_quality_min: int = 30
+    lidar_distance_bias_mm: int = 0
 
     def reset_grid(self, width: int = GRID_W, height: int = GRID_H, cell_mm: int = CELL_MM) -> None:
         self.width = width
@@ -187,12 +189,14 @@ class ProtocolParser:
 
         if match := MAP_STAT_RE.match(line):
             fields = self._parse_key_values(match.group("body"))
-            self.model.revision = int(fields.get("rev", self.model.revision))
-            self.model.inserted_points = int(fields.get("inserted", self.model.inserted_points))
-            self.model.unknown_cells = int(fields.get("unknown", self.model.unknown_cells))
-            self.model.free_cells = int(fields.get("free", self.model.free_cells))
-            self.model.occupied_cells = int(fields.get("occupied", self.model.occupied_cells))
-            self.model.tx_drops = int(fields.get("txdrop", self.model.tx_drops))
+            self.model.revision = self._get_int(fields, "rev", self.model.revision)
+            self.model.inserted_points = self._get_int(fields, "inserted", self.model.inserted_points)
+            self.model.unknown_cells = self._get_int(fields, "unknown", self.model.unknown_cells)
+            self.model.free_cells = self._get_int(fields, "free", self.model.free_cells)
+            self.model.occupied_cells = self._get_int(fields, "occupied", self.model.occupied_cells)
+            self.model.tx_drops = self._get_int(fields, "txdrop", self.model.tx_drops)
+            self.model.lidar_quality_min = self._get_int(fields, "qmin", self.model.lidar_quality_min)
+            self.model.lidar_distance_bias_mm = self._get_int(fields, "bias", self.model.lidar_distance_bias_mm)
             if "pose" in fields:
                 try:
                     x_text, y_text, h_text = fields["pose"].split(",", 2)
@@ -274,6 +278,17 @@ class ProtocolParser:
             key, value = item.split("=", 1)
             fields[key] = value
         return fields
+
+    @staticmethod
+    def _get_int(fields: Dict[str, str], key: str, default: int) -> int:
+        value = fields.get(key)
+        if value is None:
+            return default
+
+        try:
+            return int(value)
+        except ValueError:
+            return default
 
 
 class SerialWorker:
@@ -360,6 +375,7 @@ class SlamVisualizer(tk.Tk):
         self.events: queue.Queue[str] = queue.Queue()
         self.worker = SerialWorker(self.events)
         self.baud_var = tk.IntVar(value=baud)
+        self.lidar_quality_var = tk.IntVar(value=30)
         self.port_var = tk.StringVar(value=port or "COM7")
         self.port_labels: List[str] = []
         self.status_vars = {
@@ -395,12 +411,25 @@ class SlamVisualizer(tk.Tk):
         ttk.Button(toolbar, text="Connect", command=self._connect).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Disconnect", command=self._disconnect).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Replay Log", command=self._choose_replay).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="SLAM", command=self._start_slam).pack(side=tk.LEFT, padx=(16, 2))
-        ttk.Button(toolbar, text="Back", command=lambda: self.worker.write_line("BACK")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="0 Brake", command=lambda: self.worker.write_line("0")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Gyro Cal", command=lambda: self.worker.write_line("GYRO CAL")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Stop", command=lambda: self.worker.write_line("SLAM OFF")).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Show Map", command=lambda: self.worker.write_line("SHOW MAP")).pack(side=tk.LEFT, padx=2)
+
+        command_bar = ttk.Frame(self)
+        command_bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 6))
+        ttk.Button(command_bar, text="SLAM", command=self._start_slam).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="Start Map", command=self._start_map).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="Map + 96", command=self._start_map_auto96).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="Back", command=lambda: self._send_command("BACK")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="0 Brake", command=lambda: self._send_command("0")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="Reset Map North", command=lambda: self._send_command("RESET FRONT")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="Gyro Cal", command=lambda: self._send_command("GYRO CAL")).pack(side=tk.LEFT, padx=2)
+        ttk.Label(command_bar, text="Q>=").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Entry(command_bar, textvariable=self.lidar_quality_var, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="Set Q", command=self._set_lidar_quality).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="94 Odom 350mm", command=lambda: self._send_command("94")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="End Encoder", command=lambda: self._send_command("END ENCODER")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="MPU State", command=lambda: self._send_command("MPU STATE")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="DIR", command=lambda: self._send_command("DIR")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="Stop SLAM", command=lambda: self._send_command("SLAM OFF")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(command_bar, text="Show Map", command=lambda: self._send_command("SHOW MAP")).pack(side=tk.LEFT, padx=2)
 
         main = ttk.Frame(self)
         main.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
@@ -450,7 +479,29 @@ class SlamVisualizer(tk.Tk):
         self.model.source = port
 
     def _start_slam(self) -> None:
-        self.worker.write_line("SLAM")
+        self._send_command("SLAM")
+
+    def _start_map(self) -> None:
+        self._send_command("START MAP")
+
+    def _start_map_auto96(self) -> None:
+        self._send_command("START MAP")
+        self.after(200, lambda: self._send_command("96"))
+
+    def _set_lidar_quality(self) -> None:
+        try:
+            quality = int(self.lidar_quality_var.get())
+        except (tk.TclError, ValueError):
+            quality = 30
+        quality = max(0, min(63, quality))
+        self.lidar_quality_var.set(quality)
+        self._send_command(f"LIDAR QUALITY {quality}")
+
+    def _send_command(self, command: str) -> None:
+        self.worker.write_line(command)
+        self.model.raw_log.append(f"> {command}")
+        if len(self.model.raw_log) > LOG_LIMIT:
+            del self.model.raw_log[: len(self.model.raw_log) - LOG_LIMIT]
 
     def _disconnect(self) -> None:
         self.worker.disconnect()
@@ -486,7 +537,8 @@ class SlamVisualizer(tk.Tk):
         self.status_vars["map"].set(
             f"MAP {self.model.map_state} {self.model.width}x{self.model.height} "
             f"cell={self.model.cell_mm}mm rev={self.model.revision} rows={self.model.rows_received} "
-            f"free={self.model.free_cells} occ={self.model.occupied_cells} txdrop={self.model.tx_drops}"
+            f"free={self.model.free_cells} occ={self.model.occupied_cells} "
+            f"q>={self.model.lidar_quality_min} bias={self.model.lidar_distance_bias_mm}mm txdrop={self.model.tx_drops}"
         )
         if self.model.pose.valid:
             self.status_vars["pose"].set(

@@ -105,7 +105,7 @@
 #define ANGLE_TURN_FINE_PWM         320U
 #define MAPPING_START_X_MM          (-1500L)
 #define MAPPING_START_Y_MM          (-1500L)
-#define MAPPING_START_HEADING_CDEG  0L
+#define MAPPING_START_HEADING_CDEG  9000L
 #define MAPPING_POSE_HISTORY_LENGTH 64U
 #define MAPPING_LIDAR_POINT_MAX_AGE_MS 250U
 #define ENCODER_RIGHT_DELTA_SIGN    (-1L)
@@ -315,6 +315,7 @@ static void TestApp_StartGyroCalibration(void);
 static void TestApp_UpdateGyroCalibration(uint32_t now_ms, int16_t left_delta, int16_t right_delta);
 static void TestApp_UpdateOdomDebug(uint32_t now_ms, int16_t left_delta, int16_t right_delta);
 static void TestApp_StreamOdomDebug(void);
+static void TestApp_SetLidarQualityFilter(const char *text);
 static void TestApp_StartAutoMapping(void);
 static void TestApp_StopAutoMapping(void);
 static void TestApp_UpdateAutoMapping(uint32_t now_ms);
@@ -330,6 +331,7 @@ static void TestApp_StartHeadingTurn(int32_t target_heading_cdeg, uint8_t correc
 static void TestApp_StopAngleTurn(bool completed);
 static void TestApp_UpdateAngleTurn(uint32_t now_ms);
 static uint16_t TestApp_ParseTurnDegrees(const char *text);
+static uint8_t TestApp_ParseLidarQuality(const char *text, uint8_t fallback);
 static int32_t TestApp_SignedHeadingErrorCdeg(int32_t target_cdeg, int32_t current_cdeg);
 static int32_t TestApp_SnapHeadingToMazeAxis(int32_t heading_cdeg);
 static int32_t TestApp_GetAutoTurnTargetHeading(int8_t direction, uint16_t requested_degrees);
@@ -339,6 +341,7 @@ static void TestApp_RequestFullMapStream(void);
 static void TestApp_SendMapHeader(const char *state);
 static void TestApp_SendMapStat(void);
 static void TestApp_SendMpuState(void);
+static void TestApp_ResetMapNorth(void);
 static void TestApp_SendDirState(void);
 static int32_t AppAbs32(int32_t value);
 static uint16_t ClampPwmPermille(uint16_t value, uint16_t max_value);
@@ -1129,6 +1132,10 @@ static void TestApp_HandleBluetoothCommands(void)
         (void)BluetoothControl_SendText("LIDAR STOP\r\n");
         break;
 
+      case BLUETOOTH_CMD_LIDAR_QUALITY_SET:
+        TestApp_SetLidarQualityFilter(command.text);
+        break;
+
       case BLUETOOTH_CMD_ODOM_DEBUG_ON:
         TestApp_StartOdomDebug();
         break;
@@ -1191,6 +1198,10 @@ static void TestApp_HandleBluetoothCommands(void)
 
       case BLUETOOTH_CMD_LIDAR_FRONT_STATE:
         TestApp_SendLidarFrontState();
+        break;
+
+      case BLUETOOTH_CMD_DIR_RESET:
+        TestApp_ResetMapNorth();
         break;
 
       case BLUETOOTH_CMD_DIR_STATE:
@@ -1710,6 +1721,20 @@ static void TestApp_StreamOdomDebug(void)
   (void)BluetoothControl_SendText(line);
 }
 
+static void TestApp_SetLidarQualityFilter(const char *text)
+{
+  char line[80];
+  uint8_t min_quality = TestApp_ParseLidarQuality(text, LidarPipeline_GetMinPointQuality());
+
+  LidarPipeline_SetMinPointQuality(min_quality);
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "LIDAR QUALITY min=%u\r\n",
+      (unsigned int)LidarPipeline_GetMinPointQuality());
+  (void)BluetoothControl_SendText(line);
+}
+
 static uint16_t TestApp_ParseTurnDegrees(const char *text)
 {
   uint32_t value = 0U;
@@ -1745,6 +1770,34 @@ static uint16_t TestApp_ParseTurnDegrees(const char *text)
   }
 
   return (uint16_t)value;
+}
+
+static uint8_t TestApp_ParseLidarQuality(const char *text, uint8_t fallback)
+{
+  uint32_t value = 0U;
+  bool has_digit = false;
+
+  if (text == NULL)
+  {
+    return fallback;
+  }
+
+  while (*text != '\0')
+  {
+    if ((*text >= '0') && (*text <= '9'))
+    {
+      has_digit = true;
+      value = (value * 10U) + (uint32_t)(*text - '0');
+      if (value > 63U)
+      {
+        value = 63U;
+        break;
+      }
+    }
+    text++;
+  }
+
+  return has_digit ? (uint8_t)value : fallback;
 }
 
 static void TestApp_StartAngleTurn(int8_t direction, uint16_t degrees)
@@ -2536,7 +2589,7 @@ static void TestApp_SendMapStat(void)
   (void)snprintf(
       line,
       sizeof(line),
-      "MAP STAT active=%u rev=%lu inserted=%lu rejected=%lu unknown=%u free=%u occupied=%u clipped=%lu drops=%lu txdrop=%lu pose=%ld,%ld,%ld\r\n",
+      "MAP STAT active=%u rev=%lu inserted=%lu rejected=%lu unknown=%u free=%u occupied=%u clipped=%lu drops=%lu txdrop=%lu qmin=%u bias=%u pose=%ld,%ld,%ld\r\n",
       mapping_active ? 1U : 0U,
       (unsigned long)stats.revision,
       (unsigned long)stats.inserted_points,
@@ -2547,6 +2600,8 @@ static void TestApp_SendMapStat(void)
       (unsigned long)stats.clipped_rays,
       (unsigned long)LidarPipeline_GetPointQueueDrops(),
       (unsigned long)bt_state.tx_drops,
+      (unsigned int)LidarPipeline_GetMinPointQuality(),
+      (unsigned int)LidarPipeline_GetDistanceBiasMm(),
       (long)mapping_pose.x_mm,
       (long)mapping_pose.y_mm,
       (long)mapping_pose.heading_cdeg);
@@ -2570,6 +2625,34 @@ static void TestApp_SendMpuState(void)
       (long)mapping_pose.heading_cdeg,
       (unsigned int)mapping_active,
       (unsigned int)gyro_calibration_active);
+  (void)BluetoothControl_SendText(line);
+}
+
+static void TestApp_ResetMapNorth(void)
+{
+  char line[128];
+  uint32_t now = HAL_GetTick();
+  int32_t old_heading_cdeg = NormalizeHeadingCdeg(mapping_pose.heading_cdeg);
+
+  mapping_pose.heading_cdeg = MAPPING_START_HEADING_CDEG;
+  odom_debug_heading_cdeg = 0L;
+  gyro_z_corrected_dps_x100 = 0L;
+  mapping_travel_residual_x1000 = 0L;
+  last_mapping_pose_tick_ms = now;
+
+  MappingGrid_SetPose(&mapping_pose);
+  TestApp_ResetPoseHistory();
+  TestApp_RecordPoseHistory(now);
+
+  (void)snprintf(
+      line,
+      sizeof(line),
+      "DIR RESET old=%ld new=%ld map=%u mpu=%u bias=%ld\r\n",
+      (long)old_heading_cdeg,
+      (long)mapping_pose.heading_cdeg,
+      (unsigned int)mapping_active,
+      (unsigned int)mpu_state.ready,
+      (long)gyro_z_bias_dps_x100);
   (void)BluetoothControl_SendText(line);
 }
 

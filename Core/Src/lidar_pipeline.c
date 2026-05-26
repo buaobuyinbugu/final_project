@@ -29,7 +29,9 @@ extern UART_HandleTypeDef huart1;
 #define LIDAR_PROTOCOL_Q6_TO_CDEG_DENOMINATOR 64UL
 #define LIDAR_BODY_ANGLE_SIGN                 (-1L)
 #define LIDAR_BODY_YAW_OFFSET_CDEG            18000L
-#define LIDAR_MIN_POINT_QUALITY       30U
+#define LIDAR_DEFAULT_MIN_POINT_QUALITY       30U
+#define LIDAR_MAX_POINT_QUALITY               63U
+#define LIDAR_DISTANCE_BIAS_MM                350U
 
 typedef struct
 {
@@ -76,6 +78,7 @@ static volatile uint32_t s_total_node_count;
 static volatile uint32_t s_total_scan_start_count;
 static volatile uint32_t s_uart_error_count;
 static volatile uint8_t s_restart_pending;
+static uint8_t s_min_point_quality = LIDAR_DEFAULT_MIN_POINT_QUALITY;
 static bool s_scan_command_sent;
 static bool s_pipeline_initialized;
 static bool s_latest_result_valid;
@@ -94,6 +97,7 @@ static void LidarPoint_Publish(const LidarNode_t *node);
 static bool LidarCommand_SendRequest(uint8_t command);
 static bool LidarCommand_StartScan(void);
 static uint16_t LidarProtocol_AngleQ6ToCdeg(uint16_t angle_q6);
+static uint16_t LidarPipeline_CorrectDistanceMm(uint16_t raw_distance_mm);
 static int32_t LidarPipeline_NormalizeAngleCdeg(int32_t angle_cdeg);
 
 bool LidarPipeline_Init(void)
@@ -192,6 +196,33 @@ uint32_t LidarPipeline_GetPointQueueDrops(void)
   taskEXIT_CRITICAL();
 
   return drops;
+}
+
+void LidarPipeline_SetMinPointQuality(uint8_t min_quality)
+{
+  if (min_quality > LIDAR_MAX_POINT_QUALITY)
+  {
+    min_quality = LIDAR_MAX_POINT_QUALITY;
+  }
+
+  taskENTER_CRITICAL();
+  s_min_point_quality = min_quality;
+  taskEXIT_CRITICAL();
+}
+
+uint8_t LidarPipeline_GetMinPointQuality(void)
+{
+  uint8_t min_quality;
+
+  taskENTER_CRITICAL();
+  min_quality = s_min_point_quality;
+  taskEXIT_CRITICAL();
+  return min_quality;
+}
+
+uint16_t LidarPipeline_GetDistanceBiasMm(void)
+{
+  return LIDAR_DISTANCE_BIAS_MM;
 }
 
 int32_t LidarPipeline_LidarToRobotAngleCdeg(uint16_t lidar_angle_cdeg)
@@ -497,7 +528,7 @@ static bool LidarNode_TryDecode(const uint8_t raw_node[LIDAR_NODE_SIZE], LidarNo
   node->is_scan_start = start_bit;
   node->quality = raw_node[0] >> 2U;
   node->angle_cdeg = LidarProtocol_AngleQ6ToCdeg(angle_q6);
-  node->distance_mm = (uint16_t)(distance_q2 / 4U);
+  node->distance_mm = LidarPipeline_CorrectDistanceMm((uint16_t)(distance_q2 / 4U));
 
   return true;
 }
@@ -511,6 +542,21 @@ static uint16_t LidarProtocol_AngleQ6ToCdeg(uint16_t angle_q6)
   return (uint16_t)(angle_cdeg % 36000UL);
 }
 
+static uint16_t LidarPipeline_CorrectDistanceMm(uint16_t raw_distance_mm)
+{
+  if (raw_distance_mm == 0U)
+  {
+    return 0U;
+  }
+
+  if (raw_distance_mm <= LIDAR_DISTANCE_BIAS_MM)
+  {
+    return 1U;
+  }
+
+  return (uint16_t)(raw_distance_mm - LIDAR_DISTANCE_BIAS_MM);
+}
+
 static void LidarPoint_Publish(const LidarNode_t *node)
 {
   LidarPoint_t point;
@@ -521,7 +567,7 @@ static void LidarPoint_Publish(const LidarNode_t *node)
     return;
   }
 
-  if (node->quality < LIDAR_MIN_POINT_QUALITY)
+  if (node->quality < LidarPipeline_GetMinPointQuality())
   {
     return;
   }
